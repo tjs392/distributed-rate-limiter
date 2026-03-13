@@ -1,6 +1,5 @@
 mod crdt;
-
-use smallvec::SmallVec;
+pub mod types;
 use std::mem::{size_of, align_of};
 
 use crate::crdt::gcounter::GCounter;

@@ -1,6 +1,7 @@
 use smallvec::SmallVec;
 
-type NodeId = u128;
+use crate::types::{Epoch, NodeId};
+
 
 /*
     each entry in contributions represents:
@@ -12,9 +13,22 @@ type NodeId = u128;
     - when merging with another replica, you take the max of the elems
     - total count = sum of contributions
 */
+
+/*
+    see:
+    Shapiro, Marc. "A comprehensive study of convergent and commutative replicated data types." (2011).
+
+    this has a nice explanation in 3.1.2 of the g counter i'm using here
+    this is a state based increment only counter
+*/
+
+/*
+    we want a GCounter for each key for each node
+*/
+
 #[derive(Clone, Debug)]
 pub struct GCounter {
-    contributions: SmallVec<[(NodeId, u64); 8]>,
+    contributions: SmallVec<[(NodeId, Epoch); 8]>,
 }
 
 impl GCounter {
@@ -45,12 +59,8 @@ impl GCounter {
         }
     }
 
-    fn total(&self) -> u64 {
-        let mut total = 0;
-        for entry in &self.contributions {
-            total += entry.1;
-        }
-        total
+    pub fn total(&self) -> u64 {
+        self.contributions.iter().map(|(node, count)| count).sum()
     }
 }
 
