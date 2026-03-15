@@ -31,13 +31,18 @@ impl Limiter {
         let epoch = now_ms / window_ms;
         let elapsed_frac = (now_ms % window_ms) as f64 / window_ms as f64;
 
-        self.store.increment(key_hash, epoch, self.node_id, hits);
         let estimate = self.store.estimated_count(key_hash, epoch, elapsed_frac);
-        
-        if estimate > limit as f64 {
+
+        if estimate + hits as f64 > limit as f64 {
+            // TODO: retry_after_ms currently returns time until next epoch boundary.
+            // With sliding window, actual retry time depends on previous epoch decay.
+            // Good enough for now — production systems (Cloudflare, GitHub) do the same.
             RateLimitResult::Deny { retry_after_ms: (epoch + 1) * window_ms - now_ms }
         } else {
-            RateLimitResult::Allow { remaining: (limit as f64 - estimate) as u64 }
+            // Essential bug catch -- before i was incrementing counts when denied
+            // move this increment to after the estimate
+            self.store.increment(key_hash, epoch, self.node_id, hits);
+            RateLimitResult::Allow { remaining: (limit as f64 - estimate - hits as f64) as u64 }
         }
     }
 }

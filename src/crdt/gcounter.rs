@@ -1,7 +1,7 @@
+use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
 use crate::types::{Epoch, NodeId};
-
 
 /*
     each entry in contributions represents:
@@ -26,7 +26,7 @@ use crate::types::{Epoch, NodeId};
     we want a GCounter for each key for each node
 */
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GCounter {
     contributions: SmallVec<[(NodeId, Epoch); 8]>,
 }

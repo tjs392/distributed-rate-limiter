@@ -4,8 +4,8 @@
 */
 use dashmap::{DashMap, DashSet};
 
-use crate::types::{Epoch, NodeId, KeyHash};
-use crate::GCounter;
+use crate::crdt::GCounter;
+use crate::types::{Epoch, KeyHash, NodeId};
 
 pub struct CRDTStore {
         
