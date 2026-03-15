@@ -1,6 +1,6 @@
 /*
-    crdt:
-    Conflict-free Replicated Data Type Store
+    crdt/store.rs:
+    Conflict-free Replicated Data Type Store for Storing Counts per Node
 */
 use dashmap::{DashMap, DashSet};
 

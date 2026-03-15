@@ -1,3 +1,8 @@
+/*
+    limiter/limiter.rs
+    The Limiter. This connects to the store and checks the limits
+    and current counts in epoch per KeyHash, Epoch pair
+*/
 use std::sync::Arc;
 use xxhash_rust::xxh3::xxh3_64;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -18,6 +23,10 @@ impl Limiter {
             store,
             node_id,
         }
+    }
+
+    pub fn node_id(&self) -> NodeId {
+        self.node_id
     }
 
     pub fn check_rate_limit(&self, key: &str, limit: u64, hits: u64, window_ms: u64) -> RateLimitResult {

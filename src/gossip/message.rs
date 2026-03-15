@@ -1,3 +1,7 @@
+/*
+    gossip/message.rs
+    The gossip message used by the gossip engine
+*/
 use serde::{Deserialize, Serialize};
 
 use crate::{crdt::GCounter, types::{Epoch, KeyHash, NodeId}};

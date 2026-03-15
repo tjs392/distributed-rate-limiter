@@ -1,3 +1,7 @@
+/*
+    gossip/engine.rs
+    The Gossip Engine: send and receives delta data per node
+*/
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use tokio::{net::UdpSocket, time::interval};

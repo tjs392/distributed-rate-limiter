@@ -1,3 +1,8 @@
+/*
+    crdt/gcounter.rs:
+    Global Counter for Counting Calls Per KeyHash, EPoch
+*/
+
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
