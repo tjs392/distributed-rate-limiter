@@ -28,6 +28,7 @@ pub struct GossipConfig {
 pub struct ServerConfig {
     pub http_port: u16,
     pub gossip_port: u16,
+    pub metrics_port: u16,
 }
 
 pub fn load(path: &str) -> Config {

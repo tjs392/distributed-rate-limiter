@@ -6,7 +6,8 @@ services:
       - ./config:/config
     ports:
       - "8080:8080"
-      
+      - "9090:9090"
+
   node2:
     build: .
     command: ["--config", "/config/node2.toml"]
@@ -14,6 +15,7 @@ services:
       - ./config:/config
     ports:
       - "8081:8080"
+      - "9091:9090"
 
   node3:
     build: .
@@ -22,3 +24,4 @@ services:
       - ./config:/config
     ports:
       - "8082:8080"
+      - "9092:9090"

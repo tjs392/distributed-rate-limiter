@@ -9,3 +9,4 @@ interval_ms = 100
 [server]
 http_port = 8080
 gossip_port = 9000
+metrics_port = 9090

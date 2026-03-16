@@ -36,6 +36,11 @@ impl CRDTStore {
         }
     }
 
+    /// Returns length of counter
+    pub fn len(&self) -> usize {
+        self.counters.len()
+    }
+
     /// Takes key_hash and epoch and increments the counter for this key
     pub fn increment(&self, key_hash: KeyHash, epoch: Epoch, node_id: NodeId, hits: u64) {
         let key = (key_hash, epoch);

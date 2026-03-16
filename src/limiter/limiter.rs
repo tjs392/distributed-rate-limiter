@@ -4,6 +4,7 @@
     and current counts in epoch per KeyHash, Epoch pair
 */
 use std::sync::Arc;
+use metrics::{counter, histogram};
 use xxhash_rust::xxh3::xxh3_64;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -30,6 +31,8 @@ impl Limiter {
     }
 
     pub fn check_rate_limit(&self, key: &str, limit: u64, hits: u64, window_ms: u64) -> RateLimitResult {
+        let start = std::time::Instant::now();
+
         let key_hash = xxh3_64(key.as_bytes());
 
         let now_ms = SystemTime::now()
@@ -42,17 +45,18 @@ impl Limiter {
 
         let estimate = self.store.estimated_count(key_hash, epoch, elapsed_frac);
 
-        if estimate + hits as f64 > limit as f64 {
-            // TODO: retry_after_ms currently returns time until next epoch boundary.
-            // With sliding window, actual retry time depends on previous epoch decay.
-            // Good enough for now, but maybe look into later
+        let result = if estimate + hits as f64 > limit as f64 {
+            counter!("rate_limit_checks_total", "result" => "deny").increment(1);
             RateLimitResult::Deny { retry_after_ms: (epoch + 1) * window_ms - now_ms }
         } else {
-            // Essential bug catch -- before i was incrementing counts when denied
-            // move this increment to after the estimate
             self.store.increment(key_hash, epoch, self.node_id, hits);
+            counter!("rate_limit_checks_total", "result" => "allow").increment(1);
             RateLimitResult::Allow { remaining: (limit as f64 - estimate - hits as f64) as u64 }
-        }
+        };
+
+        histogram!("rate_limit_check_duration_seconds").record(start.elapsed().as_secs_f64());
+
+        result
     }
 }
 

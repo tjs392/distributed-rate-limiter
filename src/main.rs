@@ -5,6 +5,8 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use clap::Parser;
+use metrics::gauge;
+use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::time::interval;
 
 use crate::{crdt::CRDTStore, gossip::GossipEngine, limiter::Limiter};
@@ -47,6 +49,7 @@ async fn main() {
 
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", cfg.server.gossip_port).parse().unwrap();
     let http_addr: SocketAddr = format!("0.0.0.0:{}", cfg.server.http_port).parse().unwrap();
+    let metrics_addr: SocketAddr = format!("0.0.0.0:{}", cfg.server.metrics_port).parse().unwrap();
     let node_id = cfg.node.id;
 
     let store = Arc::new(CRDTStore::new());
@@ -58,10 +61,14 @@ async fn main() {
         bind_addr,
     );
 
-    let limiter = Arc::new(Limiter::new(Arc::clone(&store), node_id));
-
+    // This runs the gossip engine
     engine.run().await;
 
+    // Set up metrics
+    PrometheusBuilder::new().with_http_listener(metrics_addr).install()
+        .expect("failed to install metrics exporter");
+
+    // This sets up an eviction task (every 10 seconds for now)
     let eviction_store = Arc::clone(&store);
     tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(10));
@@ -69,9 +76,13 @@ async fn main() {
         loop {
             ticker.tick().await;
             eviction_store.evict(Duration::from_secs(cfg.node.eviction_ttl_seconds));
+            gauge!("store_entries_total").set(eviction_store.len() as f64);
         }
     });
 
+    let limiter = Arc::new(Limiter::new(Arc::clone(&store), node_id));
+
+    // This sets up the listener
     let router = crate::server::http::create_router(Arc::clone(&limiter));
     let listener = tokio::net::TcpListener::bind(http_addr).await.unwrap();
 

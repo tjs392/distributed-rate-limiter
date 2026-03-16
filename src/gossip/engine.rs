@@ -4,6 +4,7 @@
 */
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
+use metrics::{counter, gauge};
 use tokio::{net::UdpSocket, time::interval};
 
 use crate::{crdt::CRDTStore, gossip::GossipMessage, types::NodeId};
@@ -56,6 +57,9 @@ impl GossipEngine {
             let deltas = store.take_delta();
             if deltas.is_empty() { continue }
 
+            // track how many dirty keys per round
+            gauge!("gossip_delta_size").set(deltas.len() as f64);
+
             /*
                 The GossipEngine packages up all of the dirtry (change)
                 gcounter on its node and sends out the updates to its peers
@@ -69,6 +73,7 @@ impl GossipEngine {
                 updates: deltas,
             };
 
+
             // rmp_serde = rust message pack, binary, compact, faster than regular
             // serde_json this uses MessagePack format
             let bytes = match rmp_serde::to_vec(&msg) {
@@ -81,6 +86,8 @@ impl GossipEngine {
             for peer in &peers {
                 let _ = socket.send_to(&bytes, peer).await;
             }
+
+            counter!("gossip_messages_sent_total").increment(peers.len() as u64)
         }
     }
 
@@ -98,8 +105,13 @@ impl GossipEngine {
 
             let msg: GossipMessage = match rmp_serde::from_slice(&buffer[..len]) {
                 Ok(m) => m,
-                Err(_) => continue,
+                Err(_) => {
+                    counter!("gossip_deserialize_errors_total").increment(1);
+                    continue
+                },
             };
+
+            counter!("gossip_message_received_total").increment(1);
 
             for ((key_hash, epoch), counter) in &msg.updates {
                 store.merge_remote(*key_hash, *epoch, counter);
