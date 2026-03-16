@@ -20,6 +20,7 @@ mod limiter;
 mod types;
 mod server;
 mod config;
+mod membership;
 
 #[derive(Parser, Debug)]
 #[command(name = "distributed-rate-limiter")]
@@ -57,12 +58,21 @@ async fn main() {
     let node_id = cfg.node.id;
 
     let store = Arc::new(CRDTStore::new());
+    let peer_table = Arc::new(membership::PeerTable::new());
+    for (i, addr) in peers.iter().enumerate() {
+        // HACKY TODO: Figure this ugliness out
+        // this is temporary nodeid for seeds
+        // they update dynamically through gossip messages
+        peer_table.insert(*addr, (i + 100) as u128);
+    }
+
     let engine = GossipEngine::new(
         Arc::clone(&store),
         node_id,
         peers,
         cfg.gossip.interval_ms,
         bind_addr,
+        Arc::clone(&peer_table),
     );
 
     // This runs the gossip engine
@@ -82,6 +92,13 @@ async fn main() {
             eviction_store.evict(Duration::from_secs(cfg.node.eviction_ttl_seconds));
             gauge!("store_entries_total").set(eviction_store.len() as f64);
         }
+    });
+
+    // This spawns the membership probe task
+    let probe_table = Arc::clone(&peer_table);
+    let probe_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+    tokio::spawn(async move {
+        membership::probe::probe(probe_table, probe_addr, node_id, 1).await;
     });
 
     let limiter = Arc::new(Limiter::new(Arc::clone(&store), node_id));

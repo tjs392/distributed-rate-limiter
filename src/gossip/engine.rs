@@ -7,9 +7,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use metrics::{counter, gauge};
 use tokio::{net::UdpSocket, time::interval};
 
-use crate::{crdt::CRDTStore, gossip::GossipMessage, types::NodeId};
-
-const UDP_PACKET_MAX_SIZE: usize = 65535;
+use crate::{crdt::CRDTStore, gossip::GossipMessage, membership::{PeerTable, ProbeMessage}, types::{NodeId, UDP_PACKET_MAX_SIZE}};
 
 /// The Gossip engine sends and receives counter updates
 /// from nodes in the peer cluster, updating its
@@ -20,6 +18,7 @@ pub struct GossipEngine {
     peer_addresses: Vec<SocketAddr>,
     gossip_interval: u64,
     receiver_bind_address: SocketAddr,
+    peer_table: Arc<PeerTable>,
 }
 
 impl GossipEngine {
@@ -28,7 +27,8 @@ impl GossipEngine {
         node_id: NodeId, 
         peer_addresses: Vec<SocketAddr>, 
         gossip_interval: u64,
-        receiver_bind_address: SocketAddr
+        receiver_bind_address: SocketAddr,
+        peer_table: Arc<PeerTable>,
     ) -> Self {
 
         GossipEngine {
@@ -37,6 +37,7 @@ impl GossipEngine {
             peer_addresses,
             gossip_interval,
             receiver_bind_address,
+            peer_table,
         }
 
     }
@@ -92,6 +93,8 @@ impl GossipEngine {
     }
 
     async fn receiver_loop(
+        node_id: NodeId,
+        peer_table: Arc<PeerTable>,
         store: Arc<CRDTStore>,
         bind_addr: SocketAddr,
     ) -> tokio::io::Result<()> {
@@ -101,7 +104,24 @@ impl GossipEngine {
         let mut buffer = vec![0u8; UDP_PACKET_MAX_SIZE];
 
         loop {
-            let (len, _) = socket.recv_from(&mut buffer).await?;
+            let (len, src) = socket.recv_from(&mut buffer).await?;
+
+            // Adding in functionality to detect if it's a probe message
+            if let Ok(probe) = rmp_serde::from_slice::<ProbeMessage>(&buffer[..len]) {
+                match probe {
+                    ProbeMessage::Ping { sender_id, seq } => {
+                        let ack = ProbeMessage::Ack { sender_id: node_id, seq };
+                        let bytes = rmp_serde::to_vec(&ack).unwrap();
+                        let _ = socket.send_to(&bytes, src).await;
+                        peer_table.mark_alive(sender_id);
+                        continue;
+                    }
+                    ProbeMessage::Ack { .. } => {
+                        // ignore Acks, as they're handled by the probing func
+                        continue;
+                    }
+                }
+            }
 
             let msg: GossipMessage = match rmp_serde::from_slice(&buffer[..len]) {
                 Ok(m) => m,
@@ -125,6 +145,7 @@ impl GossipEngine {
         let peers = self.peer_addresses.clone();
         let interval_ms = self.gossip_interval;
         let bind_addr = self.receiver_bind_address;
+        let peer_table = Arc::clone(&self.peer_table);
 
         let sender_store = Arc::clone(&store);
         // move is needed because async blocks need to take ownership of all environemnts
@@ -133,10 +154,9 @@ impl GossipEngine {
         });
 
         tokio::spawn(async move {
-            Self::receiver_loop(store, bind_addr).await;
+            Self::receiver_loop(node_id, peer_table, store, bind_addr).await;
         });
     }
-
 }
 
 
@@ -161,6 +181,7 @@ mod tests {
 
     use crate::crdt::store::CRDTStore;
     use crate::gossip::engine::GossipEngine;
+    use crate::membership::PeerTable;
     use crate::types::NodeId;
 
     const NODE_A: NodeId = 1;
@@ -172,37 +193,47 @@ mod tests {
         format!("127.0.0.1:{}", port).parse().unwrap()
     }
 
+    fn make_peer_table(peers: Vec<(NodeId, SocketAddr)>) -> Arc<PeerTable> {
+        let table = Arc::new(PeerTable::new());
+        for (id, addr) in peers {
+            table.insert(addr, id);
+        }
+        table
+    }
+
     #[tokio::test]
     async fn two_nodes_sync() {
         let store_a = Arc::new(CRDTStore::new());
         let store_b = Arc::new(CRDTStore::new());
 
+        let table_a = make_peer_table(vec![(NODE_B, addr(19001))]);
+        let table_b = make_peer_table(vec![(NODE_A, addr(19000))]);
+
         let engine_a = GossipEngine::new(
             Arc::clone(&store_a),
             NODE_A,
-            vec![addr(19001)],  // A sends to B's receiver
-            50,                  // fast interval for testing
-            addr(19000),         // A listens on 19000
+            vec![addr(19001)],
+            50,
+            addr(19000),
+            table_a,
         );
 
         let engine_b = GossipEngine::new(
             Arc::clone(&store_b),
             NODE_B,
-            vec![addr(19000)],  // B sends to A's receiver
+            vec![addr(19000)],
             50,
-            addr(19001),         // B listens on 19001
+            addr(19001),
+            table_b,
         );
 
         engine_a.run().await;
         engine_b.run().await;
 
-        // Increment on node A only
         store_a.increment(KEY, EPOCH, NODE_A, 10);
 
-        // Wait for gossip to propagate
         sleep(Duration::from_millis(300)).await;
 
-        // Node B should have the count from node A
         let count_b = store_b.estimated_count(KEY, EPOCH, 1.0);
         assert_eq!(count_b, 10.0);
     }
@@ -212,12 +243,16 @@ mod tests {
         let store_a = Arc::new(CRDTStore::new());
         let store_b = Arc::new(CRDTStore::new());
 
+        let table_a = make_peer_table(vec![(NODE_B, addr(19003))]);
+        let table_b = make_peer_table(vec![(NODE_A, addr(19002))]);
+
         let engine_a = GossipEngine::new(
             Arc::clone(&store_a),
             NODE_A,
             vec![addr(19003)],
             50,
             addr(19002),
+            table_a,
         );
 
         let engine_b = GossipEngine::new(
@@ -226,18 +261,17 @@ mod tests {
             vec![addr(19002)],
             50,
             addr(19003),
+            table_b,
         );
 
         engine_a.run().await;
         engine_b.run().await;
 
-        // Both nodes get traffic
         store_a.increment(KEY, EPOCH, NODE_A, 10);
         store_b.increment(KEY, EPOCH, NODE_B, 20);
 
         sleep(Duration::from_millis(300)).await;
 
-        // Both should see the combined count
         let count_a = store_a.estimated_count(KEY, EPOCH, 1.0);
         let count_b = store_b.estimated_count(KEY, EPOCH, 1.0);
         assert_eq!(count_a, 30.0);
@@ -249,12 +283,16 @@ mod tests {
         let store_a = Arc::new(CRDTStore::new());
         let store_b = Arc::new(CRDTStore::new());
 
+        let table_a = make_peer_table(vec![(NODE_B, addr(19005))]);
+        let table_b = make_peer_table(vec![(NODE_A, addr(19004))]);
+
         let engine_a = GossipEngine::new(
             Arc::clone(&store_a),
             NODE_A,
             vec![addr(19005)],
             50,
             addr(19004),
+            table_a,
         );
 
         let engine_b = GossipEngine::new(
@@ -263,15 +301,14 @@ mod tests {
             vec![addr(19004)],
             50,
             addr(19005),
+            table_b,
         );
 
         engine_a.run().await;
         engine_b.run().await;
 
-        // No increments, just let gossip run
         sleep(Duration::from_millis(200)).await;
 
-        // Both stores should be empty, nothing crashes
         assert_eq!(store_a.estimated_count(KEY, EPOCH, 1.0), 0.0);
         assert_eq!(store_b.estimated_count(KEY, EPOCH, 1.0), 0.0);
     }

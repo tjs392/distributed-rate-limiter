@@ -15,6 +15,7 @@
  
 ## TODO
 
+- Right now peer gossip broadcasting is hardcoded to each peer, make this random
 - Make nice documented README with diagrams and such
 - SWIM + Lifeguard membership (dynamic peer discovery)
 - Rules-based gRPC config (replace hardcoded limits)
