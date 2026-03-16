@@ -8,6 +8,9 @@ use clap::Parser;
 use metrics::gauge;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::time::interval;
+use tonic::transport::Server;
+use crate::server::grpc::ratelimit::rate_limit_service_server::RateLimitServiceServer;
+use crate::server::grpc::RateLimitServer;
 
 use crate::{crdt::CRDTStore, gossip::GossipEngine, limiter::Limiter};
 
@@ -50,6 +53,7 @@ async fn main() {
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", cfg.server.gossip_port).parse().unwrap();
     let http_addr: SocketAddr = format!("0.0.0.0:{}", cfg.server.http_port).parse().unwrap();
     let metrics_addr: SocketAddr = format!("0.0.0.0:{}", cfg.server.metrics_port).parse().unwrap();
+    let grpc_addr: SocketAddr = format!("0.0.0.0:{}", cfg.server.grpc_port).parse().unwrap();
     let node_id = cfg.node.id;
 
     let store = Arc::new(CRDTStore::new());
@@ -81,6 +85,16 @@ async fn main() {
     });
 
     let limiter = Arc::new(Limiter::new(Arc::clone(&store), node_id));
+
+    // Set up the gRPC server for envoy
+    let grpc_server = RateLimitServer::new(Arc::clone(&limiter));
+    tokio::spawn(async move {
+        println!("node {} gRPC listening on {}", node_id, grpc_addr);
+        Server::builder()
+            .add_service(RateLimitServiceServer::new(grpc_server))
+            .serve(grpc_addr)
+            .await.unwrap();
+    });
 
     // This sets up the listener
     let router = crate::server::http::create_router(Arc::clone(&limiter));

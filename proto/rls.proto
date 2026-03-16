@@ -1,0 +1,89 @@
+// Envoy Rate Limit Service (RLS) Proto — Simplified
+//
+// This is a simplified, wire-compatible version of Envoy's rls.proto:
+// https://github.com/envoyproxy/envoy/blob/main/api/envoy/service/ratelimit/v3/rls.proto
+//
+// Stripped of Envoy-internal annotations (udpa, xds) and unused fields (Quota,
+// google.protobuf.Duration) so it compiles standalone with tonic-build.
+// Same package, service name, and field numbers — Envoy can't tell the difference.
+//
+// How it works:
+//
+//   Envoy receives an HTTP request that needs rate limiting. It packages up
+//   the request info and sends it here via gRPC. We check the limit and
+//   tell Envoy to allow or deny.
+//
+// RateLimitRequest:
+//   - domain: namespace string (e.g. "my_app") to separate different apps' limits
+//   - descriptors: list of key-value pairs describing what's being limited
+//     e.g. [("user_id", "12345"), ("path", "/api/search")]
+//   - hits_addend: how many hits this request counts for (default 1)
+//
+// RateLimitDescriptor:
+//   Hierarchical key-value entries. We concatenate domain + entries into a
+//   rate limit key: "my_app:user_id:12345:path:/api/search", hash it,
+//   and pass it to our limiter.
+//
+// RateLimitResponse:
+//   - overall_code: OK or OVER_LIMIT
+//   - statuses: per-descriptor status with individual code, current limit,
+//     and remaining count
+//
+//   Envoy reads overall_code and either forwards the request to the backend
+//   or returns 429 to the client.
+
+syntax = "proto3";
+
+package envoy.service.ratelimit.v3;
+
+service RateLimitService {
+  rpc ShouldRateLimit(RateLimitRequest) returns (RateLimitResponse) {}
+}
+
+message RateLimitRequest {
+  string domain = 1;
+  repeated RateLimitDescriptor descriptors = 2;
+  uint32 hits_addend = 3;
+}
+
+message RateLimitDescriptor {
+  message Entry {
+    string key = 1;
+    string value = 2;
+  }
+  repeated Entry entries = 1;
+}
+
+message RateLimitResponse {
+  enum Code {
+    UNKNOWN = 0;
+    OK = 1;
+    OVER_LIMIT = 2;
+  }
+
+  message RateLimit {
+    uint32 requests_per_unit = 1;
+    Unit unit = 2;
+    string name = 3;
+
+    enum Unit {
+      UNKNOWN = 0;
+      SECOND = 1;
+      MINUTE = 2;
+      HOUR = 3;
+      DAY = 4;
+      MONTH = 5;
+      YEAR = 6;
+    }
+  }
+
+  message DescriptorStatus {
+    Code code = 1;
+    RateLimit current_limit = 2;
+    uint32 limit_remaining = 3;
+    uint64 duration_until_reset = 4;
+  }
+
+  Code overall_code = 1;
+  repeated DescriptorStatus statuses = 2;
+}
