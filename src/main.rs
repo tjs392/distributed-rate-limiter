@@ -25,13 +25,25 @@ struct Args {
 
 #[tokio::main]
 async fn main() {
-    let args = Args::parse();
-    let cfg = config::load(&args.config);
+    println!("starting distributed-rate-limiter...");
 
-    let peers: Vec<SocketAddr> = cfg.node.seeds
-        .iter()
-        .map(|p| p.parse().expect("Invalid peer address"))
-        .collect();
+    let args = Args::parse();
+    println!("loading config from: {}", args.config);
+
+    let cfg = config::load(&args.config);
+    println!("node {} starting", cfg.node.id);
+
+    let mut peers: Vec<SocketAddr> = vec![];
+    for seed in &cfg.node.seeds {
+        match tokio::net::lookup_host(seed).await {
+            Ok(mut addrs) => {
+                if let Some(addr) = addrs.next() {
+                    peers.push(addr);
+                }
+            }
+            Err(e) => eprintln!("failed to resolve {}: {}", seed, e),
+        }
+    }
 
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", cfg.server.gossip_port).parse().unwrap();
     let http_addr: SocketAddr = format!("0.0.0.0:{}", cfg.server.http_port).parse().unwrap();

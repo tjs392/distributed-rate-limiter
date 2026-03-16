@@ -1,0 +1,24 @@
+services:
+  node1:
+    build: .
+    command: ["--config", "/config/node1.toml"]
+    volumes:
+      - ./config:/config
+    ports:
+      - "8080:8080"
+      
+  node2:
+    build: .
+    command: ["--config", "/config/node2.toml"]
+    volumes:
+      - ./config:/config
+    ports:
+      - "8081:8080"
+
+  node3:
+    build: .
+    command: ["--config", "/config/node3.toml"]
+    volumes:
+      - ./config:/config
+    ports:
+      - "8082:8080"
