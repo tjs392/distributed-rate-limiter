@@ -1,0 +1,10 @@
+[node]
+id = 1
+seeds = ["127.0.0.1:9001"]
+
+[gossip]
+interval_ms = 100
+
+[server]
+http_port = 8080
+gossip_port = 9000

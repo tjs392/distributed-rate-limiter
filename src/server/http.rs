@@ -55,7 +55,7 @@ async fn check_handler(
         RateLimitResult::Deny { retry_after_ms } => {
             let resp = CheckResponse {
                 status: StatusCode::TOO_MANY_REQUESTS.as_u16(), 
-                remaining: None,
+                remaining: Some(0),
                 retry_after_ms: Some(retry_after_ms),
             };
             Json(resp)
