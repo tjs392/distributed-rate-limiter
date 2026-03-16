@@ -2,9 +2,10 @@
     main.rs
     Per node setup. Start with nodeid, port, peers, gossip intervals, etc.
 */
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use clap::Parser;
+use tokio::time::interval;
 
 use crate::{crdt::CRDTStore, gossip::GossipEngine, limiter::Limiter};
 
@@ -48,6 +49,16 @@ async fn main() {
     let limiter = Arc::new(Limiter::new(Arc::clone(&store), node_id));
 
     engine.run().await;
+
+    let eviction_store = Arc::clone(&store);
+    tokio::spawn(async move {
+        let mut ticker = interval(Duration::from_secs(10));
+
+        loop {
+            ticker.tick().await;
+            eviction_store.evict(Duration::from_secs(cfg.node.eviction_ttl_seconds));
+        }
+    });
 
     let router = crate::server::http::create_router(Arc::clone(&limiter));
     let listener = tokio::net::TcpListener::bind(http_addr).await.unwrap();

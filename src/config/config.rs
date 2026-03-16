@@ -16,6 +16,7 @@ pub struct Config {
 pub struct NodeConfig {
     pub id: u128,
     pub seeds: Vec<String>,
+    pub eviction_ttl_seconds: u64,
 }
 
 #[derive(Deserialize)]

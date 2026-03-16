@@ -45,7 +45,7 @@ impl Limiter {
         if estimate + hits as f64 > limit as f64 {
             // TODO: retry_after_ms currently returns time until next epoch boundary.
             // With sliding window, actual retry time depends on previous epoch decay.
-            // Good enough for now — production systems (Cloudflare, GitHub) do the same.
+            // Good enough for now, but maybe look into later
             RateLimitResult::Deny { retry_after_ms: (epoch + 1) * window_ms - now_ms }
         } else {
             // Essential bug catch -- before i was incrementing counts when denied

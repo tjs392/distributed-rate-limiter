@@ -1,6 +1,7 @@
 [node]
 id = 1
 seeds = ["127.0.0.1:9001"]
+eviction_ttl_seconds = 10
 
 [gossip]
 interval_ms = 100

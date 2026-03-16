@@ -1,10 +1,12 @@
+use std::time::{Duration, Instant};
+
 /*
     crdt/store.rs:
     Conflict-free Replicated Data Type Store for Storing Counts per Node
 */
 use dashmap::{DashMap, DashSet};
 
-use crate::crdt::GCounter;
+use crate::crdt::{GCounter, TimestampedGCounter};
 use crate::types::{Epoch, KeyHash, NodeId};
 
 pub struct CRDTStore {
@@ -20,7 +22,7 @@ pub struct CRDTStore {
         This is due to internal sharding
     */
     /// (Key_hash, Epoch) -> GCounter
-    counters: DashMap<(KeyHash, Epoch), GCounter>,
+    counters: DashMap<(KeyHash, Epoch), TimestampedGCounter>,
     
     dirty_set: DashSet<(KeyHash, Epoch)>,
 }
@@ -38,12 +40,9 @@ impl CRDTStore {
     pub fn increment(&self, key_hash: KeyHash, epoch: Epoch, node_id: NodeId, hits: u64) {
         let key = (key_hash, epoch);
 
-        let mut counter = self
-            .counters
-            .entry(key)
-            .or_insert_with(GCounter::new);
-
-        counter.increment(node_id, hits);
+        let mut entry = self.counters.entry(key).or_default();
+        entry.last_accessed = Instant::now();
+        entry.counter.increment(node_id, hits);
         
         self.dirty_set.insert(key);
     }
@@ -52,12 +51,8 @@ impl CRDTStore {
     pub fn merge_remote(&self, key_hash: KeyHash, epoch: Epoch, remote_counter: &GCounter) {
         let key = (key_hash, epoch);
 
-        let mut counter = self
-            .counters
-            .entry(key)
-            .or_insert_with(GCounter::new);
-
-        counter.merge(remote_counter);
+        let mut entry = self.counters.entry(key).or_default();
+        entry.counter.merge(remote_counter);
 
         // Important! Don't mark dirty for this, don't need to re gossip everythiung
     }
@@ -69,7 +64,7 @@ impl CRDTStore {
 
         dirty_keys.into_iter()
             .filter_map(|key| {
-                self.counters.get(&key).map(|c| (key, c.clone()))
+                self.counters.get(&key).map(|c| (key, c.counter.clone()))
             })
             .collect()
     }
@@ -82,14 +77,20 @@ impl CRDTStore {
         let key_prev = (key_hash, epoch.saturating_sub(1));
 
         let current_total = self.counters.get(&key_current)
-            .map(|c| c.total() as f64)
+            .map(|c| c.counter.total() as f64)
             .unwrap_or(0.0);
         
         let prev_total = self.counters.get(&key_prev)
-            .map(|c| c.total() as f64)
+            .map(|c| c.counter.total() as f64)
             .unwrap_or(0.0);
 
         current_total + prev_total * (1.0 - elapsed_frac)
+    }
+
+    /// Evict all keys by last access
+    pub fn evict(&self, ttl: Duration) {
+        let cutoff = Instant::now() - ttl;
+        self.counters.retain(|_, entry| entry.last_accessed > cutoff);
     }
 }
 
@@ -241,5 +242,25 @@ mod tests {
         assert_eq!(store.estimated_count(KEY, 42, 0.0), 50.0);
         assert_eq!(store.estimated_count(KEY, 42, 0.5), 50.0);
         assert_eq!(store.estimated_count(KEY, 42, 1.0), 50.0);
+    }
+
+    #[test]
+    fn eviction_removes_old_entries() {
+        let store = CRDTStore::new();
+        store.increment(KEY, EPOCH, NODE_A, 10);
+
+        store.evict(Duration::from_secs(0));
+
+        assert_eq!(store.estimated_count(KEY, EPOCH, 1.0), 0.0);
+    }
+
+    #[test]
+    fn eviction_keeps_recent_entries() {
+        let store = CRDTStore::new();
+        store.increment(KEY, EPOCH, NODE_A, 10);
+
+        store.evict(Duration::from_secs(3600));
+
+        assert_eq!(store.estimated_count(KEY, EPOCH, 1.0), 10.0);
     }
 }

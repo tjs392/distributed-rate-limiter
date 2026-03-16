@@ -3,6 +3,8 @@
     Global Counter for Counting Calls Per KeyHash, EPoch
 */
 
+use std::time::Instant;
+
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
@@ -72,6 +74,21 @@ impl GCounter {
 impl Default for GCounter {
     fn default() -> Self {
         GCounter::new()
+    }
+}
+
+/// Wrapper around a GCounter with a timestamp for proper store eviction
+pub struct TimestampedGCounter {
+    pub counter: GCounter,
+    pub last_accessed: Instant,
+}
+
+impl Default for TimestampedGCounter {
+    fn default() -> Self {
+        TimestampedGCounter {
+            counter: GCounter::new(),
+            last_accessed: Instant::now(),
+        }
     }
 }
 
