@@ -4,27 +4,62 @@ services:
     command: ["--config", "/config/node1.toml"]
     volumes:
       - ./config:/config
+    stop_grace_period: 1s
     ports:
       - "8080:8080"
       - "9090:9090"
       - "50051:50051"
+    expose:
+      - "9000"
 
   node2:
     build: .
     command: ["--config", "/config/node2.toml"]
     volumes:
       - ./config:/config
+    stop_grace_period: 1s
     ports:
       - "8081:8080"
       - "9091:9090"
       - "50052:50051"
+    expose:
+      - "9000"
 
   node3:
     build: .
     command: ["--config", "/config/node3.toml"]
     volumes:
       - ./config:/config
+    stop_grace_period: 1s
     ports:
       - "8082:8080"
       - "9092:9090"
       - "50053:50051"
+    expose:
+      - "9000"
+
+  node4:
+    build: .
+    command: ["--config", "/config/node4.toml"]
+    volumes:
+      - ./config:/config
+    stop_grace_period: 1s
+    ports:
+      - "8083:8080"
+      - "9093:9090"
+      - "50054:50051"
+    expose:
+      - "9000"
+
+  node5:
+    build: .
+    command: ["--config", "/config/node5.toml"]
+    volumes:
+      - ./config:/config
+    stop_grace_period: 1s
+    ports:
+      - "8084:8080"
+      - "9094:9090"
+      - "50055:50051"
+    expose:
+      - "9000"

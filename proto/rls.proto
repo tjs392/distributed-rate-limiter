@@ -3,14 +3,14 @@
 // This is a simplified, wire-compatible version of Envoy's rls.proto:
 // https://github.com/envoyproxy/envoy/blob/main/api/envoy/service/ratelimit/v3/rls.proto
 //
-// Stripped of Envoy-internal annotations (udpa, xds) and unused fields (Quota,
+// Stripped of Envoy internal annotations (udpa, xds) and unused fields (Quota,
 // google.protobuf.Duration) so it compiles standalone with tonic-build.
 // Same package, service name, and field numbers — Envoy can't tell the difference.
 //
 // How it works:
 //
 //   Envoy receives an HTTP request that needs rate limiting. It packages up
-//   the request info and sends it here via gRPC. We check the limit and
+//   the request info and sends it here via gRPC. Then i check the limit and
 //   tell Envoy to allow or deny.
 //
 // RateLimitRequest:

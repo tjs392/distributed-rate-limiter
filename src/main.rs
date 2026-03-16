@@ -1,3 +1,4 @@
+use tokio::net::UdpSocket;
 /*
     main.rs
     Per node setup. Start with nodeid, port, peers, gossip intervals, etc.
@@ -31,6 +32,8 @@ struct Args {
 
 #[tokio::main]
 async fn main() {
+    tracing_subscriber::fmt::init();
+
     println!("starting distributed-rate-limiter...");
 
     let args = Args::parse();
@@ -38,18 +41,6 @@ async fn main() {
 
     let cfg = config::load(&args.config);
     println!("node {} starting", cfg.node.id);
-
-    let mut peers: Vec<SocketAddr> = vec![];
-    for seed in &cfg.node.seeds {
-        match tokio::net::lookup_host(seed).await {
-            Ok(mut addrs) => {
-                if let Some(addr) = addrs.next() {
-                    peers.push(addr);
-                }
-            }
-            Err(e) => eprintln!("failed to resolve {}: {}", seed, e),
-        }
-    }
 
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", cfg.server.gossip_port).parse().unwrap();
     let http_addr: SocketAddr = format!("0.0.0.0:{}", cfg.server.http_port).parse().unwrap();
@@ -59,19 +50,28 @@ async fn main() {
 
     let store = Arc::new(CRDTStore::new());
     let peer_table = Arc::new(membership::PeerTable::new());
-    for (i, addr) in peers.iter().enumerate() {
-        // HACKY TODO: Figure this ugliness out
-        // this is temporary nodeid for seeds
-        // they update dynamically through gossip messages
-        peer_table.insert(*addr, (i + 100) as u128);
+
+    let mut peers: Vec<SocketAddr> = vec![];
+    for seed in &cfg.node.seeds {
+        match tokio::net::lookup_host(&seed.address).await {
+            Ok(mut addrs) => {
+                if let Some(addr) = addrs.next() {
+                    peers.push(addr);
+                    peer_table.insert(addr, seed.id);
+                }
+            }
+            Err(e) => eprintln!("failed to resolve {}: {}", seed.address, e),
+        }
     }
+
+    let gossip_socket = Arc::new(UdpSocket::bind(bind_addr).await.unwrap());
 
     let engine = GossipEngine::new(
         Arc::clone(&store),
         node_id,
         peers,
         cfg.gossip.interval_ms,
-        bind_addr,
+        Arc::clone(&gossip_socket),
         Arc::clone(&peer_table),
     );
 
@@ -96,9 +96,18 @@ async fn main() {
 
     // This spawns the membership probe task
     let probe_table = Arc::clone(&peer_table);
-    let probe_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+    let probe_socket = Arc::clone(&gossip_socket);
     tokio::spawn(async move {
-        membership::probe::probe(probe_table, probe_addr, node_id, 1).await;
+        membership::probe::probe(
+            probe_table,
+            probe_socket,
+            node_id,
+            cfg.membership.probe_interval_seconds,
+            cfg.membership.probe_timeout_ms,
+            cfg.membership.base_suspicion_timeout_ms,
+            cfg.membership.min_suspicion_timeout_ms,
+            cfg.membership.max_health_score,
+        ).await;
     });
 
     let limiter = Arc::new(Limiter::new(Arc::clone(&store), node_id));

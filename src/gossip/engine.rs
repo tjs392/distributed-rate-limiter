@@ -7,7 +7,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use metrics::{counter, gauge};
 use tokio::{net::UdpSocket, time::interval};
 
-use crate::{crdt::CRDTStore, gossip::GossipMessage, membership::{PeerTable, ProbeMessage}, types::{NodeId, UDP_PACKET_MAX_SIZE}};
+use crate::{crdt::CRDTStore, gossip::{GossipMessage, PeerEntry}, membership::{PeerTable, ProbeMessage}, types::{NodeId, UDP_PACKET_MAX_SIZE}};
 
 /// The Gossip engine sends and receives counter updates
 /// from nodes in the peer cluster, updating its
@@ -17,46 +17,61 @@ pub struct GossipEngine {
     node_id: NodeId,
     peer_addresses: Vec<SocketAddr>,
     gossip_interval: u64,
-    receiver_bind_address: SocketAddr,
+    socket: Arc<UdpSocket>,
     peer_table: Arc<PeerTable>,
 }
 
 impl GossipEngine {
     pub fn new(
-        store: Arc<CRDTStore>, 
-        node_id: NodeId, 
-        peer_addresses: Vec<SocketAddr>, 
+        store: Arc<CRDTStore>,
+        node_id: NodeId,
+        peer_addresses: Vec<SocketAddr>,
         gossip_interval: u64,
-        receiver_bind_address: SocketAddr,
+        socket: Arc<UdpSocket>,
         peer_table: Arc<PeerTable>,
     ) -> Self {
-
         GossipEngine {
             store,
             node_id,
             peer_addresses,
             gossip_interval,
-            receiver_bind_address,
+            socket,
             peer_table,
         }
-
     }
 
     async fn sender_loop(
-        store: Arc<CRDTStore>, 
-        node_id: NodeId, 
-        peers: Vec<SocketAddr>, 
-        interval_ms: u64
+        store: Arc<CRDTStore>,
+        peer_table: Arc<PeerTable>,
+        node_id: NodeId,
+        seed_peers: Vec<SocketAddr>,
+        interval_ms: u64,
+        socket: Arc<UdpSocket>,
     ) -> tokio::io::Result<()> {
-        // port 0:0 cause we're sending
-        let socket = UdpSocket::bind("0.0.0.0:0").await?;
         let mut ticker = interval(Duration::from_millis(interval_ms));
 
         loop {
             ticker.tick().await;
 
+
+            /*
+                Doing peer merging of seed peers so we don't
+                need to see each peer per node.
+                Just need a full graph of peers and this will propagate through
+                For example, if node1 is seeded with all of the other nodes,
+                and the each other node is seeded with node1, then each node will
+                eventually converge to have their peer set be all other
+                peers in the cluster
+             */
+            let alive = peer_table.get_alive_peers();
+            tracing::debug!("node {} alive peers: {:?}", node_id, alive.iter().map(|(id,_)| id).collect::<Vec<_>>());
+            let peer_entries: Vec<PeerEntry> = alive
+                .iter()
+                .map(|(id, addr)| PeerEntry { node_id: *id, address: *addr })
+                .collect();
+            
             let deltas = store.take_delta();
-            if deltas.is_empty() { continue }
+            if deltas.is_empty() && peer_entries.is_empty() { continue }
 
             // track how many dirty keys per round
             gauge!("gossip_delta_size").set(deltas.len() as f64);
@@ -72,6 +87,7 @@ impl GossipEngine {
             let msg = GossipMessage {
                 sender_id: node_id,
                 updates: deltas,
+                peers: peer_entries,
             };
 
 
@@ -81,14 +97,30 @@ impl GossipEngine {
                 Ok(b) => b,
                 Err(_) => continue,
             };
+            
+            let targets: Vec<SocketAddr> = {
+                let alive_addrs: Vec<SocketAddr> = alive.iter().map(|(_, addr)| *addr).collect();
+                if alive_addrs.is_empty() {
+                    seed_peers.clone()
+                } else {
+                    // always include seeds so newly joined nodes get the full peer list
+                    let mut t = alive_addrs;
+                    for seed in &seed_peers {
+                        if !t.contains(seed) {
+                            t.push(*seed);
+                        }
+                    }
+                    t
+                }
+            };
 
             // TODO: right now this sends to all peers, need to just send to a few random
             // for convergence
-            for peer in &peers {
+            for peer in &targets {
                 let _ = socket.send_to(&bytes, peer).await;
             }
 
-            counter!("gossip_messages_sent_total").increment(peers.len() as u64)
+            counter!("gossip_messages_sent_total").increment(targets.len() as u64);
         }
     }
 
@@ -96,28 +128,37 @@ impl GossipEngine {
         node_id: NodeId,
         peer_table: Arc<PeerTable>,
         store: Arc<CRDTStore>,
-        bind_addr: SocketAddr,
+        socket: Arc<UdpSocket>,
     ) -> tokio::io::Result<()> {
-
-        let socket = UdpSocket::bind(bind_addr).await?;
         // 65535 bytes = udp max packet size
         let mut buffer = vec![0u8; UDP_PACKET_MAX_SIZE];
 
         loop {
             let (len, src) = socket.recv_from(&mut buffer).await?;
+            tracing::debug!("receiver got {} bytes from {}", len, src);
 
             // Adding in functionality to detect if it's a probe message
             if let Ok(probe) = rmp_serde::from_slice::<ProbeMessage>(&buffer[..len]) {
                 match probe {
                     ProbeMessage::Ping { sender_id, seq } => {
+                        // if this is the first time seeing this node, then add it to the
+                        // peer table
+                        if !peer_table.get(&sender_id) {
+                            peer_table.insert(src, sender_id);
+                            tracing::info!("receiver: inserted new peer {} at {}", sender_id, src);
+                        }
+                        peer_table.mark_alive(sender_id);
                         let ack = ProbeMessage::Ack { sender_id: node_id, seq };
                         let bytes = rmp_serde::to_vec(&ack).unwrap();
                         let _ = socket.send_to(&bytes, src).await;
                         peer_table.mark_alive(sender_id);
                         continue;
                     }
-                    ProbeMessage::Ack { .. } => {
-                        // ignore Acks, as they're handled by the probing func
+                    ProbeMessage::Ack { sender_id, .. } => {
+                        // ack received: mark the peer alive so probe.rs
+                        // sees the updated state after its sleep window
+                        peer_table.mark_alive(sender_id);
+                        tracing::info!("peer {} alive (probe ack)", sender_id);
                         continue;
                     }
                 }
@@ -131,7 +172,21 @@ impl GossipEngine {
                 },
             };
 
+            // if this is the first time seeing this node, then add it to the
+            // peer table
+            if !peer_table.get(&msg.sender_id) {
+                peer_table.insert(src, msg.sender_id);
+            }
+            peer_table.mark_alive(msg.sender_id);
+
             counter!("gossip_message_received_total").increment(1);
+
+            for peer in &msg.peers {
+                if peer.node_id != node_id && !peer_table.get(&peer.node_id) {
+                    peer_table.insert(peer.address, peer.node_id);
+                    tracing::info!("discovered peer {} via gossip from {}", peer.node_id, msg.sender_id);
+                }
+            }
 
             for ((key_hash, epoch), counter) in &msg.updates {
                 store.merge_remote(*key_hash, *epoch, counter);
@@ -144,17 +199,25 @@ impl GossipEngine {
         let node_id = self.node_id;
         let peers = self.peer_addresses.clone();
         let interval_ms = self.gossip_interval;
-        let bind_addr = self.receiver_bind_address;
-        let peer_table = Arc::clone(&self.peer_table);
+        let socket = Arc::clone(&self.socket);
+        let peer_table_sender_ref = Arc::clone(&self.peer_table);
+        let sender_socket = Arc::clone(&self.socket);
 
         let sender_store = Arc::clone(&store);
-        // move is needed because async blocks need to take ownership of all environemnts
         tokio::spawn(async move {
-            Self::sender_loop(sender_store, node_id, peers, interval_ms).await;
+            let _ = Self::sender_loop(
+                sender_store, 
+                peer_table_sender_ref, 
+                node_id, 
+                peers, 
+                interval_ms,
+                sender_socket,
+            ).await;
         });
 
+        let peer_table_receiver_ref = Arc::clone(&self.peer_table);
         tokio::spawn(async move {
-            Self::receiver_loop(node_id, peer_table, store, bind_addr).await;
+            let _ = Self::receiver_loop(node_id, peer_table_receiver_ref, store, socket).await;
         });
     }
 }
@@ -178,6 +241,7 @@ mod tests {
     use std::sync::Arc;
     use std::net::SocketAddr;
     use tokio::time::{sleep, Duration};
+    use tokio::net::UdpSocket;
 
     use crate::crdt::store::CRDTStore;
     use crate::gossip::engine::GossipEngine;
@@ -205,63 +269,43 @@ mod tests {
     async fn two_nodes_sync() {
         let store_a = Arc::new(CRDTStore::new());
         let store_b = Arc::new(CRDTStore::new());
+        let socket_a = Arc::new(UdpSocket::bind(addr(19000)).await.unwrap());
+        let socket_b = Arc::new(UdpSocket::bind(addr(19001)).await.unwrap());
 
         let table_a = make_peer_table(vec![(NODE_B, addr(19001))]);
         let table_b = make_peer_table(vec![(NODE_A, addr(19000))]);
 
         let engine_a = GossipEngine::new(
-            Arc::clone(&store_a),
-            NODE_A,
-            vec![addr(19001)],
-            50,
-            addr(19000),
-            table_a,
+            Arc::clone(&store_a), NODE_A, vec![addr(19001)], 50, socket_a, table_a,
         );
-
         let engine_b = GossipEngine::new(
-            Arc::clone(&store_b),
-            NODE_B,
-            vec![addr(19000)],
-            50,
-            addr(19001),
-            table_b,
+            Arc::clone(&store_b), NODE_B, vec![addr(19000)], 50, socket_b, table_b,
         );
 
         engine_a.run().await;
         engine_b.run().await;
 
         store_a.increment(KEY, EPOCH, NODE_A, 10);
-
         sleep(Duration::from_millis(300)).await;
 
-        let count_b = store_b.estimated_count(KEY, EPOCH, 1.0);
-        assert_eq!(count_b, 10.0);
+        assert_eq!(store_b.estimated_count(KEY, EPOCH, 1.0), 10.0);
     }
 
     #[tokio::test]
     async fn bidirectional_sync() {
         let store_a = Arc::new(CRDTStore::new());
         let store_b = Arc::new(CRDTStore::new());
+        let socket_a = Arc::new(UdpSocket::bind(addr(19002)).await.unwrap());
+        let socket_b = Arc::new(UdpSocket::bind(addr(19003)).await.unwrap());
 
         let table_a = make_peer_table(vec![(NODE_B, addr(19003))]);
         let table_b = make_peer_table(vec![(NODE_A, addr(19002))]);
 
         let engine_a = GossipEngine::new(
-            Arc::clone(&store_a),
-            NODE_A,
-            vec![addr(19003)],
-            50,
-            addr(19002),
-            table_a,
+            Arc::clone(&store_a), NODE_A, vec![addr(19003)], 50, socket_a, table_a,
         );
-
         let engine_b = GossipEngine::new(
-            Arc::clone(&store_b),
-            NODE_B,
-            vec![addr(19002)],
-            50,
-            addr(19003),
-            table_b,
+            Arc::clone(&store_b), NODE_B, vec![addr(19002)], 50, socket_b, table_b,
         );
 
         engine_a.run().await;
@@ -269,44 +313,31 @@ mod tests {
 
         store_a.increment(KEY, EPOCH, NODE_A, 10);
         store_b.increment(KEY, EPOCH, NODE_B, 20);
-
         sleep(Duration::from_millis(300)).await;
 
-        let count_a = store_a.estimated_count(KEY, EPOCH, 1.0);
-        let count_b = store_b.estimated_count(KEY, EPOCH, 1.0);
-        assert_eq!(count_a, 30.0);
-        assert_eq!(count_b, 30.0);
+        assert_eq!(store_a.estimated_count(KEY, EPOCH, 1.0), 30.0);
+        assert_eq!(store_b.estimated_count(KEY, EPOCH, 1.0), 30.0);
     }
 
     #[tokio::test]
     async fn no_data_no_crash() {
         let store_a = Arc::new(CRDTStore::new());
         let store_b = Arc::new(CRDTStore::new());
+        let socket_a = Arc::new(UdpSocket::bind(addr(19004)).await.unwrap());
+        let socket_b = Arc::new(UdpSocket::bind(addr(19005)).await.unwrap());
 
         let table_a = make_peer_table(vec![(NODE_B, addr(19005))]);
         let table_b = make_peer_table(vec![(NODE_A, addr(19004))]);
 
         let engine_a = GossipEngine::new(
-            Arc::clone(&store_a),
-            NODE_A,
-            vec![addr(19005)],
-            50,
-            addr(19004),
-            table_a,
+            Arc::clone(&store_a), NODE_A, vec![addr(19005)], 50, socket_a, table_a,
         );
-
         let engine_b = GossipEngine::new(
-            Arc::clone(&store_b),
-            NODE_B,
-            vec![addr(19004)],
-            50,
-            addr(19005),
-            table_b,
+            Arc::clone(&store_b), NODE_B, vec![addr(19004)], 50, socket_b, table_b,
         );
 
         engine_a.run().await;
         engine_b.run().await;
-
         sleep(Duration::from_millis(200)).await;
 
         assert_eq!(store_a.estimated_count(KEY, EPOCH, 1.0), 0.0);

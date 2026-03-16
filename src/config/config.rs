@@ -10,12 +10,19 @@ pub struct Config {
     pub node: NodeConfig,
     pub gossip: GossipConfig,
     pub server: ServerConfig,
+    pub membership: MembershipConfig,
+}
+
+#[derive(Deserialize)]
+pub struct SeedNode {
+    pub id: u128,
+    pub address: String,
 }
 
 #[derive(Deserialize)]
 pub struct NodeConfig {
     pub id: u128,
-    pub seeds: Vec<String>,
+    pub seeds: Vec<SeedNode>,
     pub eviction_ttl_seconds: u64,
 }
 
@@ -30,6 +37,15 @@ pub struct ServerConfig {
     pub gossip_port: u16,
     pub metrics_port: u16,
     pub grpc_port: u16,
+}
+
+#[derive(Deserialize)]
+pub struct MembershipConfig {
+    pub probe_interval_seconds: u64,
+    pub probe_timeout_ms: u64,
+    pub min_suspicion_timeout_ms: u64,
+    pub base_suspicion_timeout_ms: u64,
+    pub max_health_score: u32,
 }
 
 pub fn load(path: &str) -> Config {
