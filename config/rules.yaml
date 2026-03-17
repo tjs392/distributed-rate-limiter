@@ -1,3 +1,23 @@
+# Rate limiting rules
+#
+# Domain: my_app (Envoy-facing, tier-based)
+#
+#   free:     600/min global
+#               60/min search, 30/min writes
+#
+#   premium:  6,000/min global
+#               600/min search, 300/min writes
+#
+#   ultra:    60,000/min (1,000/sec) global - high-frequency data
+#
+# Domain: api (per-user, direct gRPC)
+#   per user: 1,000/min
+#   per user + search: 200/min
+#   per user + write:  100/min
+#
+# Domain: internal (service-to-service)
+#   per service: 10,000/min
+
 domains:
   - domain: my_app
     descriptors:
@@ -5,22 +25,84 @@ domains:
         value: free
         rate_limit:
           unit: minute
-          requests_per_unit: 5
-      - key: tier
-        value: premium
-        rate_limit:
-          unit: minute
-          requests_per_unit: 100
+          requests_per_unit: 600
         descriptors:
           - key: path
             value: /api/search
             rate_limit:
               unit: minute
-              requests_per_unit: 10
+              requests_per_unit: 60
+          - key: path
+            value: /api/upload
+            rate_limit:
+              unit: minute
+              requests_per_unit: 30
+          - key: path
+            value: /api/write
+            rate_limit:
+              unit: minute
+              requests_per_unit: 30
+
+      - key: tier
+        value: premium
+        rate_limit:
+          unit: minute
+          requests_per_unit: 6000
+        descriptors:
+          - key: path
+            value: /api/search
+            rate_limit:
+              unit: minute
+              requests_per_unit: 600
+          - key: path
+            value: /api/upload
+            rate_limit:
+              unit: minute
+              requests_per_unit: 300
+          - key: path
+            value: /api/write
+            rate_limit:
+              unit: minute
+              requests_per_unit: 300
+
+      - key: tier
+        value: ultra
+        rate_limit:
+          unit: minute
+          requests_per_unit: 60000
+        descriptors:
+          - key: path
+            value: /api/search
+            rate_limit:
+              unit: minute
+              requests_per_unit: 6000
+          - key: path
+            value: /api/write
+            rate_limit:
+              unit: minute
+              requests_per_unit: 3000
 
   - domain: api
     descriptors:
       - key: user_id
         rate_limit:
           unit: minute
-          requests_per_unit: 50
+          requests_per_unit: 1000
+        descriptors:
+          - key: path
+            value: /api/search
+            rate_limit:
+              unit: minute
+              requests_per_unit: 200
+          - key: path
+            value: /api/write
+            rate_limit:
+              unit: minute
+              requests_per_unit: 100
+
+  - domain: internal
+    descriptors:
+      - key: service_name
+        rate_limit:
+          unit: minute
+          requests_per_unit: 10000

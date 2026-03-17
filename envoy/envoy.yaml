@@ -1,0 +1,142 @@
+## Envoy configuration for e2e rate limiting demo
+##
+## Flow:
+##   Client -> Envoy (:10000)
+##       -> gRPC rate limit check (node1:50051)
+##       -> if OK: forward to backend (:3000)
+##       -> if OVER_LIMIT: return 429
+##
+## Tiers (via x-tier header):
+##   free:    600/min
+##   premium: 6,000/min
+##   ultra:   60,000/min (1,000/sec — high-frequency)
+##
+## Path sub-limits on /api/search and /api/write
+
+static_resources:
+  listeners:
+    - name: main
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 10000
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: AUTO
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: backend
+                      domains: ["*"]
+                      routes:
+                        # /api/search — tier + path descriptors
+                        - match:
+                            path: "/api/search"
+                          route:
+                            cluster: backend
+                            rate_limits:
+                              - actions:
+                                  - request_headers:
+                                      header_name: "x-tier"
+                                      descriptor_key: "tier"
+                                  - generic_key:
+                                      descriptor_value: "/api/search"
+                                      descriptor_key: "path"
+
+                        # /api/write — tier + path descriptors
+                        - match:
+                            path: "/api/write"
+                          route:
+                            cluster: backend
+                            rate_limits:
+                              - actions:
+                                  - request_headers:
+                                      header_name: "x-tier"
+                                      descriptor_key: "tier"
+                                  - generic_key:
+                                      descriptor_value: "/api/write"
+                                      descriptor_key: "path"
+
+                        # /api/upload — tier + path descriptors
+                        - match:
+                            path: "/api/upload"
+                          route:
+                            cluster: backend
+                            rate_limits:
+                              - actions:
+                                  - request_headers:
+                                      header_name: "x-tier"
+                                      descriptor_key: "tier"
+                                  - generic_key:
+                                      descriptor_value: "/api/upload"
+                                      descriptor_key: "path"
+
+                        # Everything else — tier descriptor only
+                        - match:
+                            prefix: "/"
+                          route:
+                            cluster: backend
+                            rate_limits:
+                              - actions:
+                                  - request_headers:
+                                      header_name: "x-tier"
+                                      descriptor_key: "tier"
+
+                http_filters:
+                  - name: envoy.filters.http.ratelimit
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.ratelimit.v3.RateLimit
+                      domain: my_app
+                      failure_mode_deny: false
+                      rate_limit_service:
+                        grpc_service:
+                          envoy_grpc:
+                            cluster_name: rate_limiter
+                        transport_api_version: V3
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    - name: backend
+      connect_timeout: 1s
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: backend
+                      port_value: 3000
+
+    - name: rate_limiter
+      connect_timeout: 1s
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: rate_limiter
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: node1
+                      port_value: 50051
+
+admin:
+  address:
+    socket_address:
+      address: 0.0.0.0
+      port_value: 9901

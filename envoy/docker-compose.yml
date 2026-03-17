@@ -1,0 +1,39 @@
+# Envoy end-to-end demo
+#
+# Usage:
+#   1. Start the rate limiter cluster first:
+#        docker compose up -d
+#   2. Then start this:
+#        docker compose -f envoy/docker-compose.yml up -d
+#   3. Test:
+#        curl -H "x-tier: free" http://localhost:10000/hello
+#   4. Tear down:
+#        docker compose -f envoy/docker-compose.yml down
+#        docker compose down
+
+services:
+  envoy:
+    image: envoyproxy/envoy:v1.31-latest
+    volumes:
+      - ./envoy.yaml:/etc/envoy/envoy.yaml:ro
+    ports:
+      - "10000:10000"   # Main proxy port
+      - "9901:9901"     # Envoy admin
+    depends_on:
+      - backend
+    networks:
+      - default
+      - ratelimiter
+
+  backend:
+    build: ./backend
+    expose:
+      - "3000"
+    networks:
+      - default
+
+networks:
+  # Connect to the rate limiter cluster's network so envoy can reach node1:50051
+  ratelimiter:
+    external: true
+    name: distributed-rate-limiter_default

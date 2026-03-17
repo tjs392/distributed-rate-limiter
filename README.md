@@ -13,16 +13,17 @@
 - ttl-based eviction
 - Demo w/ Docker + docker-compose 3-node cluster
 - SWIM + Lifeguard membership (dynamic peer discovery)
+- Rules-based gRPC config (replace hardcoded limits)
+- Random gossip 
+- Hook up Envoy end-to-end
  
 ## TODO
-
-- Right now peer gossip broadcasting is hardcoded to each peer, make this random
 - Make nice documented README with diagrams and such
-- Rules-based gRPC config (replace hardcoded limits)
-- Hook up Envoy end-to-end
 - Hand-write tests (current ones are AI-generated)
 - LRU eviction for high-cardinality keys
 - Benchmarks with Criterion
+
+## TODO Later
 - eBPF kernel enforcement (maybe... this woul be cool though to have built in)
 
 ## SWIM
