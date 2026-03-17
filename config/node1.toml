@@ -1,3 +1,5 @@
+rules_file = "/config/rules.yaml"
+
 [node]
 id = 1
 eviction_ttl_seconds = 120

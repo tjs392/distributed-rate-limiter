@@ -4,7 +4,7 @@
 */
 
 use std::sync::Arc;
-use crate::limiter::Limiter;
+use crate::{limiter::Limiter, rules::{RulesConfig, match_domain_rules}};
 use ratelimit::rate_limit_response::{Code, DescriptorStatus};
 
 /// Pull in the proto's generated types:
@@ -16,12 +16,14 @@ pub mod ratelimit {
 /// gRPC Rate Limiting Server
 pub struct RateLimitServer {
     limiter: Arc<Limiter>,
+    rules: Arc<RulesConfig>,
 }
 
 impl RateLimitServer {
-    pub fn new(limiter: Arc<Limiter>) -> Self {
-        RateLimitServer {
-            limiter
+    pub fn new(limiter: Arc<Limiter>, rules: Arc<RulesConfig>) -> Self {
+        RateLimitServer { 
+            limiter, 
+            rules 
         }
     }
 }
@@ -79,16 +81,38 @@ impl ratelimit::rate_limit_service_server::RateLimitService for RateLimitServer 
 
         for descriptor in req.descriptors {
             let mut key = domain.clone();
+            let mut entries: Vec<(String, String)> = Vec::new();
+
             for entry in &descriptor.entries {
                 key.push(':');
                 key.push_str(&entry.key);
                 key.push(':');
                 key.push_str(&entry.value);
+                entries.push((entry.key.clone(), entry.value.clone()));
             }
 
-            // TODO: hardcoding window right now
-            // need to set up a rules yaml for certain limits and stuff
-            let result = self.limiter.check_rate_limit(&key, 100, hits, 60000);
+            let matched_rules = match_domain_rules(&domain, &entries, &self.rules);
+
+            if matched_rules.is_empty() {
+                // just allow through with warning by default
+                tracing::warn!("no rule matched for key: {}", key);
+                statuses.push(DescriptorStatus {
+                    code: Code::Ok.into(),
+                    current_limit: None,
+                    limit_remaining: u32::MAX,
+                    duration_until_reset: 0,
+                });
+                continue;
+            }
+
+            // apply the most restrictive matched rule by default
+            let (limit, window_ms) = matched_rules
+                .iter()
+                .min_by_key(|(limit, _)| limit)
+                .copied()
+                .unwrap();
+
+            let result = self.limiter.check_rate_limit(&key, limit, hits, window_ms);
             let status = match result {
                 crate::types::RateLimitResult::Allow { remaining } => {
                     DescriptorStatus {

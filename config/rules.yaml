@@ -1,0 +1,26 @@
+domains:
+  - domain: my_app
+    descriptors:
+      - key: tier
+        value: free
+        rate_limit:
+          unit: minute
+          requests_per_unit: 5
+      - key: tier
+        value: premium
+        rate_limit:
+          unit: minute
+          requests_per_unit: 100
+        descriptors:
+          - key: path
+            value: /api/search
+            rate_limit:
+              unit: minute
+              requests_per_unit: 10
+
+  - domain: api
+    descriptors:
+      - key: user_id
+        rate_limit:
+          unit: minute
+          requests_per_unit: 50

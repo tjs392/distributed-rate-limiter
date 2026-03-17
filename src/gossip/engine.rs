@@ -111,8 +111,6 @@ impl GossipEngine {
                 }
             };
 
-            // TODO: right now this sends to all peers, need to just send to a few random
-            // for convergence
             for peer in &targets {
                 let _ = socket.send_to(&bytes, peer).await;
             }
@@ -132,7 +130,7 @@ impl GossipEngine {
 
         loop {
             let (len, src) = socket.recv_from(&mut buffer).await?;
-            tracing::debug!("receiver got {} bytes from {}", len, src);
+            // tracing::debug!("receiver got {} bytes from {}", len, src);
 
             // Adding in functionality to detect if it's a probe message
             if let Ok(probe) = rmp_serde::from_slice::<ProbeMessage>(&buffer[..len]) {

@@ -45,6 +45,11 @@ impl Limiter {
 
         let estimate = self.store.estimated_count(key_hash, epoch, elapsed_frac);
 
+        tracing::debug!(
+            "key={} epoch={} estimate={} hits={} limit={} elapsed_frac={}",
+            key, epoch, estimate, hits, limit, elapsed_frac
+        );
+
         let result = if estimate + hits as f64 > limit as f64 {
             counter!("rate_limit_checks_total", "result" => "deny").increment(1);
             RateLimitResult::Deny { retry_after_ms: (epoch + 1) * window_ms - now_ms }

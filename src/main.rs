@@ -22,6 +22,7 @@ mod types;
 mod server;
 mod config;
 mod membership;
+mod rules;
 
 #[derive(Parser, Debug)]
 #[command(name = "distributed-rate-limiter")]
@@ -111,9 +112,13 @@ async fn main() {
     });
 
     let limiter = Arc::new(Limiter::new(Arc::clone(&store), node_id));
-
+    let rules = Arc::new(rules::loader::load(&cfg.rules_file));
+    
     // Set up the gRPC server for envoy
-    let grpc_server = RateLimitServer::new(Arc::clone(&limiter));
+    let grpc_server = RateLimitServer::new(
+        Arc::clone(&limiter),
+        Arc::clone(&rules),
+    );
     tokio::spawn(async move {
         println!("node {} gRPC listening on {}", node_id, grpc_addr);
         Server::builder()

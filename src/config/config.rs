@@ -11,6 +11,7 @@ pub struct Config {
     pub gossip: GossipConfig,
     pub server: ServerConfig,
     pub membership: MembershipConfig,
+    pub rules_file: String,
 }
 
 #[derive(Deserialize)]
