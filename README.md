@@ -22,6 +22,11 @@
 - Hand-write tests (current ones are AI-generated)
 - LRU eviction for high-cardinality keys
 - Benchmarks with Criterion
+- Persistence and restart recovery
+- Graceful shutdown
+- TLS on gossip
+- Rate limit rule hot reload
+- Observability depth
 
 ## TODO Later
 - eBPF kernel enforcement (maybe... this woul be cool though to have built in)
