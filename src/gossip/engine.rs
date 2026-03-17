@@ -5,6 +5,7 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use metrics::{counter, gauge};
+use rand::seq::IteratorRandom;
 use tokio::{net::UdpSocket, time::interval};
 
 use crate::{crdt::CRDTStore, gossip::{GossipMessage, PeerEntry}, membership::{PeerTable, ProbeMessage}, types::{NodeId, UDP_PACKET_MAX_SIZE}};
@@ -103,14 +104,10 @@ impl GossipEngine {
                 if alive_addrs.is_empty() {
                     seed_peers.clone()
                 } else {
-                    // always include seeds so newly joined nodes get the full peer list
-                    let mut t = alive_addrs;
-                    for seed in &seed_peers {
-                        if !t.contains(seed) {
-                            t.push(*seed);
-                        }
-                    }
-                    t
+                    let mut rng = rand::rng();
+                    alive.iter()
+                        .map(|(_, addr)| *addr)
+                        .sample(&mut rng, 3.min(alive.len()))
                 }
             };
 
