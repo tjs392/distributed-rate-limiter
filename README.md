@@ -30,6 +30,7 @@
 
 ## TODO Later
 - eBPF kernel enforcement (maybe... this woul be cool though to have built in)
+- pressure aware adaptive gossip protocol (gossip faster when keys approach limits)
 
 ## SWIM
 SWIM (Scalable Weakly-consistent Infection-style Membership) is a protocol for distributed systems to track which nodes are alive and which have failed, without any central coordination needed. Each node independently monitors the cluster by randomly probing peers and gossiping what it learns to others.

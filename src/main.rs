@@ -10,6 +10,7 @@ use metrics::gauge;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::time::interval;
 use tonic::transport::Server;
+use crate::gossip::{GossipMessage, PeerEntry};
 use crate::server::grpc::ratelimit::rate_limit_service_server::RateLimitServiceServer;
 use crate::server::grpc::RateLimitServer;
 
@@ -123,7 +124,7 @@ async fn main() {
         println!("node {} gRPC listening on {}", node_id, grpc_addr);
         Server::builder()
             .add_service(RateLimitServiceServer::new(grpc_server))
-            .serve(grpc_addr)
+            .serve_with_shutdown(grpc_addr, shutdown_signal())
             .await.unwrap();
     });
 
@@ -133,5 +134,45 @@ async fn main() {
 
     println!("node {} listening on http://{}", node_id, http_addr);
 
-    axum::serve(listener, router).await.unwrap();
+    axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .unwrap();
+
+    // some cleanup after graceful shutdown
+    // grpc and http servers have shut down, but tokio threads still running
+    // just send data to all peers before shutting down
+    let deltas = store.take_delta();
+
+    let alive = peer_table.get_alive_peers();
+    let peer_entries: Vec<PeerEntry> = alive
+        .iter()
+        .map(|(id, addr)| PeerEntry { node_id: *id, address: *addr })
+        .collect();
+    
+    let msg = GossipMessage {
+        sender_id: node_id,
+        updates: deltas,
+        peers: peer_entries,
+    };
+
+    // rmp_serde = rust message pack, binary, compact, faster than regular
+    // serde_json this uses MessagePack format
+    let bytes = match rmp_serde::to_vec(&msg) {
+        Ok(b) => b,
+        Err(_) => { return; },
+    };
+
+    for peer in peer_table.get_alive_peers() {
+        let _ = gossip_socket.send_to(&bytes, peer.1).await;
+    }
+
+    // just a short pause to make sure the udp opackets leave the buffer
+    tokio::time::sleep(Duration::from_millis(200)).await
+}
+
+async fn shutdown_signal() {
+    tokio::signal::ctrl_c()
+        .await
+        .expect("Failed to install signal handler");
 }
