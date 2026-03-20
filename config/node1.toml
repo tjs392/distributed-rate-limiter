@@ -3,6 +3,7 @@ rules_file = "/config/rules.yaml"
 [node]
 id = 1
 eviction_ttl_seconds = 120
+eviction_interval_seconds = 10
 
 [[node.seeds]]
 id = 2

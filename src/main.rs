@@ -86,8 +86,9 @@ async fn main() {
 
     // This sets up an eviction task (every 10 seconds for now)
     let eviction_store = Arc::clone(&store);
+    let eviction_interval_seconds = cfg.node.eviction_interval_seconds;
     tokio::spawn(async move {
-        let mut ticker = interval(Duration::from_secs(10));
+        let mut ticker = interval(Duration::from_secs(eviction_interval_seconds));
 
         loop {
             ticker.tick().await;
