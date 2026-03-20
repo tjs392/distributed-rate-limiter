@@ -24,6 +24,7 @@ mod server;
 mod config;
 mod membership;
 mod rules;
+mod persistence;
 
 #[derive(Parser, Debug)]
 #[command(name = "distributed-rate-limiter")]

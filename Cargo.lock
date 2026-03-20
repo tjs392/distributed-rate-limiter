@@ -349,6 +349,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "prost",
  "rand 0.10.0",
+ "redb",
  "rmp-serde",
  "serde",
  "serde_json",
@@ -1188,6 +1189,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "498cd0dc59d73224351ee52a95fee0f1a617a2eae0e7d9d720cc622c73a54186"
 dependencies = [
  "bitflags",
+]
+
+[[package]]
+name = "redb"
+version = "3.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef99362319c782aa4639ad3a306b64c3bb90e12874e99b8df124cb679d988611"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
