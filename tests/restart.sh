@@ -18,7 +18,4 @@ docker compose -f envoy/docker-compose.yml up -d --build
 sleep 2
 
 echo ""
-echo "Ready. Run tests with:"
-echo "  ./tests/rules.sh"
-echo "  ./tests/envoy_e2e.sh"
-echo "  ./tests/stress.sh"
+echo "Ready."

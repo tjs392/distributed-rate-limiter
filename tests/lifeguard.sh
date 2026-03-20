@@ -1,153 +1,147 @@
 #!/bin/bash
-# test_lifeguard.sh
-# Tests failure detection across a 5-node cluster
-
-set -e
+# tests/lifeguard.sh - SWIM+Lifeguard failure detection tests
 
 PORTS=(8080 8081 8082 8083 8084)
 ALIVE_PORTS=(8080 8081 8083 8084)
 NODE3_PORT=8082
+PASS=0
+FAIL=0
+
+log() { echo "[$(date '+%H:%M:%S')] $1"; }
+
+assert() {
+    local desc=$1 cond=$2
+    if eval "$cond"; then
+        echo "  PASS: $desc"
+        PASS=$((PASS + 1))
+    else
+        echo "  FAIL: $desc"
+        FAIL=$((FAIL + 1))
+    fi
+}
 
 check_request() {
-    local port=$1
-    local key=$2
-    local limit=$3
-    echo -n "node on :$port -> "
+    local port=$1 key=$2 limit=$3
     curl -s -X POST http://localhost:$port/check \
         -H "Content-Type: application/json" \
         -d "{\"key\":\"$key\",\"limit\":$limit,\"hits\":1,\"window_ms\":60000}"
-    echo ""
 }
 
 wait_for_log() {
-    local pattern=$1
-    local timeout=$2
-    local elapsed=0
-    echo -n "Waiting for '$pattern'..."
+    local pattern=$1 timeout=$2 elapsed=0
     while [ $elapsed -lt $timeout ]; do
         if docker compose logs 2>/dev/null | grep -qiE "$pattern"; then
-            echo " found (${elapsed}s)"
+            echo "  found '$pattern' (${elapsed}s)"
             return 0
         fi
         sleep 2
         elapsed=$((elapsed + 2))
-        echo -n "."
     done
-    echo " timed out after ${timeout}s"
+    echo "  timed out waiting for '$pattern' (${timeout}s)"
     return 1
 }
 
-echo "=== Building and starting 5-node cluster ==="
+# ============================================================
+log "Starting 5-node cluster"
 docker compose up --build -d
 sleep 5
 
-echo ""
-echo "=== All nodes healthy — sending requests ==="
+# ============================================================
+log "TEST 1: All nodes healthy"
+
+all_healthy=true
 for port in "${PORTS[@]}"; do
-    check_request $port "user:123" 20
+    code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:$port/health)
+    if [ "$code" != "200" ]; then all_healthy=false; fi
+done
+assert "all 5 nodes responding" "$all_healthy"
+
+# ============================================================
+log "TEST 2: Requests work across cluster"
+
+for port in "${PORTS[@]}"; do
+    RESP=$(check_request $port "lifeguard:test" 100)
+    echo "  :$port -> $RESP"
 done
 
-echo ""
-echo "=== Health check all nodes ==="
-for port in "${PORTS[@]}"; do
-    echo -n "node on :$port -> "
-    curl -s http://localhost:$port/health
-    echo ""
-done
+# ============================================================
+log "TEST 3: Kill node3, detect suspect"
 
-echo ""
-echo "=== SWIM logs before kill (should be all alive) ==="
-docker compose logs --tail=20 | grep -iE 'suspect|dead|alive' || echo "(no state transitions yet)"
-
-echo ""
-echo "=== Killing node3 ==="
 docker compose stop node3
-
-echo ""
-echo "--- Waiting for suspect transition ---"
 wait_for_log "peer 3 suspect" 60
+assert "node3 marked suspect" "docker compose logs 2>/dev/null | grep -qiE 'peer 3 suspect'"
 
-echo ""
-echo "--- Waiting for dead transition ---"
+# ============================================================
+log "TEST 4: Node3 declared dead"
+
 wait_for_log "peer 3 declared dead" 60
+assert "node3 declared dead" "docker compose logs 2>/dev/null | grep -qiE 'peer 3 declared dead'"
 
-echo ""
-echo "=== SWIM logs after kill ==="
-echo "--- Suspect transitions ---"
-docker compose logs 2>/dev/null | grep -iE 'suspect' || echo "(none)"
-echo "--- Dead transitions ---"
-docker compose logs 2>/dev/null | grep -iE 'declared dead' || echo "(none)"
+# ============================================================
+log "TEST 5: Remaining nodes still work"
 
-echo ""
-echo "=== Checking remaining nodes still work ==="
 for port in "${ALIVE_PORTS[@]}"; do
-    check_request $port "user:456" 10
+    code=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:$port/check \
+        -H "Content-Type: application/json" \
+        -d '{"key":"lifeguard:alive","limit":100,"hits":1,"window_ms":60000}')
+    assert "node :$port still serving" "[ '$code' = '200' ]"
 done
 
-echo ""
-echo "=== Node3 should be unreachable ==="
-curl -s --max-time 2 http://localhost:$NODE3_PORT/health || echo "node3: unreachable (expected)"
+# ============================================================
+log "TEST 6: Node3 unreachable"
 
-echo ""
-echo "=== Restarting node3 ==="
+code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 http://localhost:$NODE3_PORT/health)
+assert "node3 unreachable" "[ '$code' != '200' ]"
+
+# ============================================================
+log "TEST 7: Restart node3, rejoin cluster"
+
 docker compose start node3
+sleep 3
+code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:$NODE3_PORT/health)
+assert "node3 responding after restart" "[ '$code' = '200' ]"
 
-echo ""
-echo "--- Waiting for node3 to rejoin ---"
 wait_for_log "peer 3 alive" 30
+assert "node3 marked alive after rejoin" "docker compose logs 2>/dev/null | grep -qiE 'peer 3 alive'"
 
-echo ""
-echo "=== SWIM logs after rejoin ==="
-docker compose logs 2>/dev/null | grep -iE 'alive|rejoin|recovered' || echo "(none)"
+# ============================================================
+log "TEST 8: Gossip convergence after rejoin"
 
-echo ""
-echo "=== Node3 should be back ==="
-curl -s http://localhost:$NODE3_PORT/health
-echo ""
+CONV_KEY="lifeguard:conv_$(date +%s)"
+check_request 8080 "$CONV_KEY" 100000 > /dev/null
+sleep 2
 
-echo ""
-echo "=== Final check — waiting for gossip convergence ==="
-# Poll until all nodes agree or we time out
-CONVERGED=false
+converged=false
 for i in $(seq 1 12); do
     sleep 5
-    echo -n "Check $i: "
-    COUNTS=()
+    counts=()
     for port in "${PORTS[@]}"; do
-        remaining=$(curl -s -X POST http://localhost:$port/check \
-            -H "Content-Type: application/json" \
-            -d '{"key":"user:456","limit":10,"hits":1,"window_ms":60000}' \
+        remaining=$(check_request $port "$CONV_KEY" 100000 2>/dev/null \
             | grep -o '"remaining":[0-9]*' | cut -d: -f2)
-        COUNTS+=($remaining)
-        echo -n "node:$port=$remaining "
-    done
-    echo ""
-
-    # Check if all counts are equal
-    FIRST=${COUNTS[0]}
-    ALL_EQUAL=true
-    for count in "${COUNTS[@]}"; do
-        if [ "$count" != "$FIRST" ]; then
-            ALL_EQUAL=false
-            break
-        fi
+        counts+=($remaining)
     done
 
-    if $ALL_EQUAL; then
-        echo "Converged at remaining=$FIRST"
-        CONVERGED=true
+    min=${counts[0]} max=${counts[0]}
+    for c in "${counts[@]}"; do
+        [ "$c" -lt "$min" ] && min=$c
+        [ "$c" -gt "$max" ] && max=$c
+    done
+    spread=$((max - min))
+    echo "  check $i: spread=$spread (min=$min max=$max)"
+
+    if [ $spread -le 5 ]; then
+        echo "  converged (spread <= 5)"
+        converged=true
         break
     fi
 done
+assert "cluster converged after rejoin" "$converged"
 
-if ! $CONVERGED; then
-    echo "WARNING: nodes did not converge within timeout"
-fi
-
-echo ""
-echo "=== Full SWIM lifecycle log ==="
-docker compose logs 2>/dev/null | grep -iE 'suspect|dead|alive|recovered' | tail -40
+# ============================================================
+log "SWIM lifecycle log (last 30 lines)"
+docker compose logs 2>/dev/null | grep -iE 'suspect|dead|alive' | tail -30
 
 echo ""
-echo "=== Cleanup ==="
+echo "Results: $PASS passed, $FAIL failed"
 echo "Run 'docker compose down' when done"
+exit $FAIL

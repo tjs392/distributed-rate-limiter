@@ -1,130 +1,116 @@
 #!/bin/bash
-# grpc_test.sh — test the gRPC rate limit service
+# tests/grpc_test.sh - gRPC rate limit service tests
 
 PROTO="proto/rls.proto"
 ADDR="localhost:50051"
 SERVICE="envoy.service.ratelimit.v3.RateLimitService/ShouldRateLimit"
 RUN_ID=$(date +%s)
+PASS=0
+FAIL=0
+
+log() { echo "[$(date '+%H:%M:%S')] $1"; }
+
+assert() {
+    local desc=$1 cond=$2
+    if eval "$cond"; then
+        echo "  PASS: $desc"
+        PASS=$((PASS + 1))
+    else
+        echo "  FAIL: $desc"
+        FAIL=$((FAIL + 1))
+    fi
+}
 
 call_rls() {
-  local domain=$1 key=$2 value=$3 hits=${4:-1}
-  grpcurl -plaintext -proto $PROTO -d "{
-    \"domain\": \"$domain\",
-    \"descriptors\": [{\"entries\": [{\"key\": \"$key\", \"value\": \"$value\"}]}],
-    \"hits_addend\": $hits
-  }" $ADDR $SERVICE 2>&1
+    local domain=$1 key=$2 value=$3 hits=${4:-1}
+    grpcurl -plaintext -proto $PROTO -d "{
+        \"domain\": \"$domain\",
+        \"descriptors\": [{\"entries\": [{\"key\": \"$key\", \"value\": \"$value\"}]}],
+        \"hits_addend\": $hits
+    }" $ADDR $SERVICE 2>&1
 }
 
 call_rls_multi() {
-  local domain=$1
-  grpcurl -plaintext -proto $PROTO -d "{
-    \"domain\": \"$domain\",
-    \"descriptors\": [
-      {\"entries\": [{\"key\": \"user_id\", \"value\": \"multi_$RUN_ID\"}]},
-      {\"entries\": [{\"key\": \"path\", \"value\": \"/api/search\"}]}
-    ],
-    \"hits_addend\": 1
-  }" $ADDR $SERVICE 2>&1
+    local domain=$1
+    grpcurl -plaintext -proto $PROTO -d "{
+        \"domain\": \"$domain\",
+        \"descriptors\": [
+            {\"entries\": [{\"key\": \"user_id\", \"value\": \"multi_$RUN_ID\"}]},
+            {\"entries\": [{\"key\": \"path\", \"value\": \"/api/search\"}]}
+        ],
+        \"hits_addend\": 1
+    }" $ADDR $SERVICE 2>&1
 }
 
-echo "==========================================="
-echo "  gRPC RATE LIMIT SERVICE TESTS — $RUN_ID"
-echo "==========================================="
+# ============================================================
+log "TEST 1: Single request returns OK"
 
-# --- Test 1: single request returns OK ---
-echo ""
-echo "--- Test 1: single request returns OK ---"
-RESP=$(call_rls "test" "user_id" "t1_$RUN_ID")
-if echo "$RESP" | grep -q '"overallCode": "OK"'; then
-  echo "  PASS: got OK"
-else
-  echo "  FAIL: expected OK, got: $RESP"
-fi
+RESP=$(call_rls "api" "user_id" "t1_$RUN_ID")
+assert "single request OK" "echo '$RESP' | grep -q '\"overallCode\": \"OK\"'"
 
-# --- Test 2: remaining decreases ---
-echo ""
-echo "--- Test 2: remaining decreases ---"
-R1=$(call_rls "test" "user_id" "t2_$RUN_ID" | grep limitRemaining | grep -o '[0-9]*')
-R2=$(call_rls "test" "user_id" "t2_$RUN_ID" | grep limitRemaining | grep -o '[0-9]*')
-if [ "$R2" -lt "$R1" ]; then
-  echo "  PASS: remaining decreased from $R1 to $R2"
-else
-  echo "  FAIL: remaining didn't decrease ($R1 -> $R2)"
-fi
+# ============================================================
+log "TEST 2: Remaining decreases"
 
-# --- Test 3: hits_addend works ---
-echo ""
-echo "--- Test 3: hits_addend burns multiple ---"
-R1=$(call_rls "test" "user_id" "t3_$RUN_ID" 1 | grep limitRemaining | grep -o '[0-9]*')
-R2=$(call_rls "test" "user_id" "t3_$RUN_ID" 5 | grep limitRemaining | grep -o '[0-9]*')
+R1=$(call_rls "api" "user_id" "t2_$RUN_ID" | grep limitRemaining | grep -o '[0-9]*')
+R2=$(call_rls "api" "user_id" "t2_$RUN_ID" | grep limitRemaining | grep -o '[0-9]*')
+echo "  remaining: $R1 -> $R2"
+assert "remaining decreased" "[ '$R2' -lt '$R1' ]"
+
+# ============================================================
+log "TEST 3: hits_addend burns multiple"
+
+R1=$(call_rls "api" "user_id" "t3_$RUN_ID" 1 | grep limitRemaining | grep -o '[0-9]*')
+R2=$(call_rls "api" "user_id" "t3_$RUN_ID" 5 | grep limitRemaining | grep -o '[0-9]*')
 DIFF=$((R1 - R2))
-if [ "$DIFF" -eq 5 ]; then
-  echo "  PASS: burned 5 hits (remaining $R1 -> $R2)"
-else
-  echo "  FAIL: expected 5 hit decrease, got $DIFF ($R1 -> $R2)"
-fi
+echo "  remaining: $R1 -> $R2 (diff=$DIFF)"
+assert "burned 5 hits" "[ $DIFF -eq 5 ]"
 
-# --- Test 4: exceeds limit returns OVER_LIMIT ---
-echo ""
-echo "--- Test 4: exceed limit returns OVER_LIMIT ---"
-call_rls "test" "user_id" "t4_$RUN_ID" 100 > /dev/null
-RESP=$(call_rls "test" "user_id" "t4_$RUN_ID" 1)
-if echo "$RESP" | grep -q '"overallCode": "OVER_LIMIT"'; then
-  echo "  PASS: got OVER_LIMIT"
-else
-  echo "  FAIL: expected OVER_LIMIT, got: $RESP"
-fi
+# ============================================================
+log "TEST 4: Exceed limit returns OVER_LIMIT"
 
-# --- Test 5: different keys are independent ---
-echo ""
-echo "--- Test 5: different keys are independent ---"
-call_rls "test" "user_id" "t5a_$RUN_ID" 99 > /dev/null
-RESP=$(call_rls "test" "user_id" "t5b_$RUN_ID" 1)
-if echo "$RESP" | grep -q '"overallCode": "OK"'; then
-  echo "  PASS: different key unaffected"
-else
-  echo "  FAIL: different key was affected"
-fi
+call_rls "api" "user_id" "t4_$RUN_ID" 1000 > /dev/null
+RESP=$(call_rls "api" "user_id" "t4_$RUN_ID" 1)
+assert "got OVER_LIMIT" "echo '$RESP' | grep -q '\"overallCode\": \"OVER_LIMIT\"'"
 
-# --- Test 6: different domains are independent ---
-echo ""
-echo "--- Test 6: different domains are independent ---"
+# ============================================================
+log "TEST 5: Different keys are independent"
+
+call_rls "api" "user_id" "t5a_$RUN_ID" 99 > /dev/null
+RESP=$(call_rls "api" "user_id" "t5b_$RUN_ID" 1)
+assert "different key unaffected" "echo '$RESP' | grep -q '\"overallCode\": \"OK\"'"
+
+# ============================================================
+log "TEST 6: Different domains are independent"
+
 call_rls "domain_a" "user_id" "t6_$RUN_ID" 99 > /dev/null
 RESP=$(call_rls "domain_b" "user_id" "t6_$RUN_ID" 1)
-if echo "$RESP" | grep -q '"overallCode": "OK"'; then
-  echo "  PASS: different domain unaffected"
-else
-  echo "  FAIL: different domain was affected"
-fi
+assert "different domain unaffected" "echo '$RESP' | grep -q '\"overallCode\": \"OK\"'"
 
-# --- Test 7: multi-descriptor returns multiple statuses ---
-echo ""
-echo "--- Test 7: multi-descriptor returns two statuses ---"
-RESP=$(call_rls_multi "test")
+# ============================================================
+log "TEST 7: Multi-descriptor returns multiple statuses"
+
+RESP=$(call_rls_multi "api")
 STATUS_COUNT=$(echo "$RESP" | grep -c '"code"')
-if [ "$STATUS_COUNT" -eq 2 ]; then
-  echo "  PASS: got 2 descriptor statuses"
-else
-  echo "  FAIL: expected 2 statuses, got $STATUS_COUNT"
-fi
+echo "  status count: $STATUS_COUNT"
+assert "got 2 descriptor statuses" "[ $STATUS_COUNT -eq 2 ]"
 
-# --- Test 8: gossip propagates gRPC requests ---
-echo ""
-echo "--- Test 8: gossip propagation via gRPC ---"
+# ============================================================
+log "TEST 8: Gossip propagates gRPC requests"
+
 for i in $(seq 1 50); do
-  call_rls "test" "user_id" "t8_$RUN_ID" 1 > /dev/null
+    call_rls "api" "user_id" "t8_$RUN_ID" 1 > /dev/null
 done
-echo "  Sent 50 to node1 (port 50051), waiting 500ms..."
 sleep 0.5
 RESP=$(grpcurl -plaintext -proto $PROTO -d "{
-  \"domain\": \"test\",
-  \"descriptors\": [{\"entries\": [{\"key\": \"user_id\", \"value\": \"t8_$RUN_ID\"}]}],
-  \"hits_addend\": 1
+    \"domain\": \"api\",
+    \"descriptors\": [{\"entries\": [{\"key\": \"user_id\", \"value\": \"t8_$RUN_ID\"}]}],
+    \"hits_addend\": 1
 }" localhost:50052 $SERVICE 2>&1)
 REM=$(echo "$RESP" | grep limitRemaining | grep -o '[0-9]*')
-echo "  Node2 remaining: $REM (expect ~49, meaning gossip propagated)"
+echo "  node2 remaining: $REM (expect ~49 if gossip propagated)"
+assert "gossip propagated to node2" "[ -n '$REM' ] && [ '$REM' -lt 960 ]"
 
+# ============================================================
 echo ""
-echo "==========================================="
-echo "  gRPC TESTS COMPLETE"
-echo "==========================================="
+echo "Results: $PASS passed, $FAIL failed"
+exit $FAIL
