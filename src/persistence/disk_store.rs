@@ -58,15 +58,20 @@ impl DiskStore {
             Err(_) => return None,
         };
         
-        match table.get(key_bytes.as_slice()) {
+        let result = table.get(key_bytes.as_slice());
+        match result {
             Ok(Some(value)) => {
-                let counter: GCounter = rmp_serde::from_slice(value.value()).expect("failed deserializaiton");
+                let counter: GCounter = rmp_serde::from_slice(value.value()).expect("failed deserialization");
+                tracing::info!("disk hit key_hash={} epoch={}", key_hash, epoch);
                 Some(counter)
             }
-            _ => None,
+            _ => {
+                tracing::info!("disk miss key_hash={} epoch={}", key_hash, epoch);
+                None
+            }
         }
     }
-
+    
     pub fn flush_all(&self, entries: &[((u64, u64), GCounter)]) {
         let write_txn = self.db.begin_write().expect("failed begin write");
         {

@@ -103,16 +103,21 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
     use crate::crdt::store::CRDTStore;
+    use crate::persistence::DiskStore;
+    use std::fs;
 
-    fn make_router() -> Router {
+    fn make_router(name: &str) -> Router {
+        let path = format!("/tmp/test_http_{}.redb", name);
+        let _ = fs::remove_file(&path);
         let store = Arc::new(CRDTStore::new());
-        let limiter = Arc::new(Limiter::new(store, 1));
+        let disk_store = Arc::new(DiskStore::new(&path));
+        let limiter = Arc::new(Limiter::new(store, disk_store, 1));
         create_router(limiter)
     }
 
     #[tokio::test]
     async fn health_returns_ok() {
-        let app = make_router();
+        let app = make_router("health_ok");
         let req = Request::builder()
             .uri("/health")
             .method("GET")
@@ -125,7 +130,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_under_limit() {
-        let app = make_router();
+        let app = make_router("check_under");
         let req = Request::builder()
             .uri("/check")
             .method("POST")
@@ -139,7 +144,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_over_limit() {
-        let app = make_router();
+        let app = make_router("check_over");
         let req = Request::builder()
             .uri("/check")
             .method("POST")
@@ -153,7 +158,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_missing_body_returns_error() {
-        let app = make_router();
+        let app = make_router("check_missing");
         let req = Request::builder()
             .uri("/check")
             .method("POST")
@@ -167,7 +172,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_returns_node_id() {
-        let app = make_router();
+        let app = make_router("health_node_id");
         let req = Request::builder()
             .uri("/health")
             .method("GET")

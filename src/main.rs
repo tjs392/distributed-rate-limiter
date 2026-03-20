@@ -11,6 +11,7 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::time::interval;
 use tonic::transport::Server;
 use crate::gossip::{GossipMessage, PeerEntry};
+use crate::persistence::{DiskStore};
 use crate::server::grpc::ratelimit::rate_limit_service_server::RateLimitServiceServer;
 use crate::server::grpc::RateLimitServer;
 
@@ -85,14 +86,22 @@ async fn main() {
     PrometheusBuilder::new().with_http_listener(metrics_addr).install()
         .expect("failed to install metrics exporter");
 
+    
+    let disk_store = Arc::new(DiskStore::new(&format!("{}/counters.redb", cfg.node.persistent_store_path)));
+
     // This sets up an eviction task (every 10 seconds for now)
     let eviction_store = Arc::clone(&store);
+    let eviction_disk = Arc::clone(&disk_store);
     let eviction_interval_seconds = cfg.node.eviction_interval_seconds;
     tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(eviction_interval_seconds));
 
         loop {
             ticker.tick().await;
+
+            let snapshot: Vec<_> = eviction_store.take_snapshot();
+            eviction_disk.flush_all(&snapshot);
+
             eviction_store.evict(Duration::from_secs(cfg.node.eviction_ttl_seconds));
             gauge!("store_entries_total").set(eviction_store.len() as f64);
         }
@@ -114,7 +123,7 @@ async fn main() {
         ).await;
     });
 
-    let limiter = Arc::new(Limiter::new(Arc::clone(&store), node_id));
+    let limiter = Arc::new(Limiter::new(Arc::clone(&store), Arc::clone(&disk_store), node_id));
     let rules = Arc::new(rules::loader::load(&cfg.rules_file));
     
     // Set up the gRPC server for envoy
@@ -140,6 +149,10 @@ async fn main() {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .unwrap();
+
+    // flush everything to disk before shutting down
+    let snapshot = store.take_snapshot();
+    disk_store.flush_all(&snapshot);
 
     // some cleanup after graceful shutdown
     // grpc and http servers have shut down, but tokio threads still running

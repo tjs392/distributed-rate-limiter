@@ -92,6 +92,13 @@ impl CRDTStore {
         current_total + prev_total * (1.0 - elapsed_frac)
     }
 
+    pub fn take_snapshot(&self) -> Vec<((KeyHash, Epoch), GCounter)> {
+        self.counters
+            .iter()
+            .map(|entry| (*entry.key(), entry.value().counter.clone()))
+            .collect()
+    }
+
     /// Evict all keys by last access
     pub fn evict(&self, ttl: Duration) {
         let cutoff = Instant::now() - ttl;

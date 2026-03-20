@@ -9,19 +9,22 @@ use xxhash_rust::xxh3::xxh3_64;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::crdt::store::CRDTStore;
+use crate::persistence::DiskStore;
 use crate::types::{NodeId, RateLimitResult};
 
 pub struct Limiter {
     /// Store is shared across tasks
     store: Arc<CRDTStore>,
+    disk_store: Arc<DiskStore>,
     node_id: NodeId,
 }
 
 /// Limiter receives a ref to the CRDTStore so it can do operations
 impl Limiter {
-    pub fn new(store: Arc<CRDTStore>, node_id: NodeId) -> Self {
+    pub fn new(store: Arc<CRDTStore>, disk_store: Arc<DiskStore>, node_id: NodeId) -> Self {
         Limiter {
             store,
+            disk_store,
             node_id,
         }
     }
@@ -43,7 +46,23 @@ impl Limiter {
         let epoch = now_ms / window_ms;
         let elapsed_frac = (now_ms % window_ms) as f64 / window_ms as f64;
 
-        let estimate = self.store.estimated_count(key_hash, epoch, elapsed_frac);
+        let mut estimate = self.store.estimated_count(key_hash, epoch, elapsed_frac);
+
+        // check estimate and load from disk if didnt get an estimate from store
+        // this is if the stuff has been evicted from the config
+        // check your eviction_ttl_interval in node config if you're getting
+        // cache misses a lot. keys that are over the eviction limit get 
+        // evicted from the dashmap and persisted on disk
+        if estimate == 0.0 {
+            // check both current epoch and previous epoch cause thats what estimate wants
+            if let Some(counter) = self.disk_store.get(key_hash, epoch) {
+                self.store.merge_remote(key_hash, epoch, &counter);
+            }
+            if let Some(counter) = self.disk_store.get(key_hash, epoch.saturating_sub(1)) {
+                self.store.merge_remote(key_hash, epoch.saturating_sub(1), &counter);
+            }
+            estimate = self.store.estimated_count(key_hash, epoch, elapsed_frac);
+        }
 
         tracing::debug!(
             "key={} epoch={} estimate={} hits={} limit={} elapsed_frac={}",
@@ -81,28 +100,33 @@ mod tests {
     use crate::crdt::store::CRDTStore;
 
     const NODE: NodeId = 1;
+    use crate::persistence::DiskStore;
+    use std::fs;
 
-    fn make_limiter() -> Limiter {
-        Limiter::new(Arc::new(CRDTStore::new()), NODE)
+    fn make_limiter(name: &str) -> Limiter {
+        let path = format!("/tmp/test_limiter_{}.redb", name);
+        let _ = fs::remove_file(&path);
+        let disk_store = Arc::new(DiskStore::new(&path));
+        Limiter::new(Arc::new(CRDTStore::new()), disk_store, NODE)
     }
 
     #[test]
     fn under_limit_allows() {
-        let limiter = make_limiter();
+        let limiter = make_limiter("under_limit");
         let result = limiter.check_rate_limit("user:1", 10, 1, 1000);
         assert!(matches!(result, RateLimitResult::Allow { .. }));
     }
 
     #[test]
     fn over_limit_denies() {
-        let limiter = make_limiter();
+        let limiter = make_limiter("over_limit");
         let result = limiter.check_rate_limit("user:1", 5, 6, 1000);
         assert!(matches!(result, RateLimitResult::Deny { .. }));
     }
 
     #[test]
     fn remaining_decreases() {
-        let limiter = make_limiter();
+        let limiter = make_limiter("remaining_decreases");
         let r1 = limiter.check_rate_limit("user:1", 10, 3, 1000);
         let r2 = limiter.check_rate_limit("user:1", 10, 3, 1000);
 
@@ -116,14 +140,14 @@ mod tests {
 
     #[test]
     fn hits_at_exact_limit() {
-        let limiter = make_limiter();
+        let limiter = make_limiter("hits_exact");
         let result = limiter.check_rate_limit("user:1", 5, 5, 1000);
         assert!(matches!(result, RateLimitResult::Allow { .. }));
     }
 
     #[test]
     fn different_keys_independent() {
-        let limiter = make_limiter();
+        let limiter = make_limiter("diff_keys");
         limiter.check_rate_limit("user:1", 5, 5, 1000);
         let result = limiter.check_rate_limit("user:2", 5, 1, 1000);
         assert!(matches!(result, RateLimitResult::Allow { .. }));
@@ -131,7 +155,7 @@ mod tests {
 
     #[test]
     fn deny_has_positive_retry() {
-        let limiter = make_limiter();
+        let limiter = make_limiter("deny_positive_retry");
         let result = limiter.check_rate_limit("user:1", 1, 5, 1000);
         match result {
             RateLimitResult::Deny { retry_after_ms } => assert!(retry_after_ms > 0),
