@@ -73,7 +73,16 @@ impl Limiter {
             counter!("rate_limit_checks_total", "result" => "deny").increment(1);
             RateLimitResult::Deny { retry_after_ms: (epoch + 1) * window_ms - now_ms }
         } else {
-            self.store.increment(key_hash, epoch, self.node_id, hits);
+            let pressure = estimate / limit as f64;
+            let tier = match pressure {
+                p if p >= 0.90 => 4u8,
+                p if p >= 0.75 => 3,
+                p if p >= 0.50 => 2,
+                p if p >= 0.25 => 1,
+                _ => 0,
+            };
+
+            self.store.increment(key_hash, epoch, self.node_id, hits, tier);
             counter!("rate_limit_checks_total", "result" => "allow").increment(1);
             RateLimitResult::Allow { remaining: (limit as f64 - estimate - hits as f64) as u64 }
         };

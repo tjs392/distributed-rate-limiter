@@ -15,7 +15,8 @@ id = 3
 address = "node3:9000"
 
 [gossip]
-interval_ms = 100
+interval_ms = 1000
+strategy = "tiered"
 
 [server]
 http_port = 8080

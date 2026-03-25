@@ -32,6 +32,12 @@ pub struct NodeConfig {
 #[derive(Deserialize)]
 pub struct GossipConfig {
     pub interval_ms: u64,
+    #[serde(default = "default_strategy")]
+    pub strategy: String,
+}
+
+fn default_strategy() -> String {
+    "tiered".to_string()
 }
 
 #[derive(Deserialize)]

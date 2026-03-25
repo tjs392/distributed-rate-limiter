@@ -18,6 +18,7 @@ pub struct GossipEngine {
     node_id: NodeId,
     peer_addresses: Vec<SocketAddr>,
     gossip_interval: u64,
+    gossip_strategy: String,
     socket: Arc<UdpSocket>,
     peer_table: Arc<PeerTable>,
 }
@@ -28,6 +29,7 @@ impl GossipEngine {
         node_id: NodeId,
         peer_addresses: Vec<SocketAddr>,
         gossip_interval: u64,
+        gossip_strategy: String,
         socket: Arc<UdpSocket>,
         peer_table: Arc<PeerTable>,
     ) -> Self {
@@ -36,12 +38,32 @@ impl GossipEngine {
             node_id,
             peer_addresses,
             gossip_interval,
+            gossip_strategy,
             socket,
             peer_table,
         }
     }
 
     async fn sender_loop(
+        store: Arc<CRDTStore>,
+        peer_table: Arc<PeerTable>,
+        node_id: NodeId,
+        seed_peers: Vec<SocketAddr>,
+        base_interval_ms: u64,
+        strategy: String,
+        socket: Arc<UdpSocket>,
+    ) -> tokio::io::Result<()> {
+        match strategy.as_str() {
+            "tiered" => Self::sender_loop_tiered(
+                store, peer_table, node_id, seed_peers, base_interval_ms, socket
+            ).await,
+            _ => Self::sender_loop_fixed(
+                store, peer_table, node_id, seed_peers, base_interval_ms, socket
+            ).await,
+        }
+    }
+
+    async fn sender_loop_fixed(
         store: Arc<CRDTStore>,
         peer_table: Arc<PeerTable>,
         node_id: NodeId,
@@ -65,13 +87,115 @@ impl GossipEngine {
                 peers in the cluster
              */
             let alive = peer_table.get_alive_peers();
-            tracing::debug!("node {} alive peers: {:?}", node_id, alive.iter().map(|(id,_)| id).collect::<Vec<_>>());
             let peer_entries: Vec<PeerEntry> = alive
                 .iter()
                 .map(|(id, addr)| PeerEntry { node_id: *id, address: *addr })
                 .collect();
             
             let deltas = store.take_delta();
+            if deltas.is_empty() && peer_entries.is_empty() { continue }
+
+            // track how many dirty keys per round
+            gauge!("gossip_delta_size").set(deltas.len() as f64);
+
+            /*
+                The GossipEngine packages up all of the dirtry (change)
+                gcounter on its node and sends out the updates to its peers
+                over UDP
+
+                The peers then unwrap the copied gcounters and merge their
+                "deltas" with their own gcounters per hash/epoch
+             */
+            let msg = GossipMessage {
+                sender_id: node_id,
+                updates: deltas,
+                peers: peer_entries,
+            };
+
+
+            // rmp_serde = rust message pack, binary, compact, faster than regular
+            // serde_json this uses MessagePack format
+            let bytes = match rmp_serde::to_vec(&msg) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            
+            let targets: Vec<SocketAddr> = {
+                let alive_addrs: Vec<SocketAddr> = alive.iter().map(|(_, addr)| *addr).collect();
+                if alive_addrs.is_empty() {
+                    seed_peers.clone()
+                } else {
+                    let mut rng = rand::rng();
+                    alive.iter()
+                        .map(|(_, addr)| *addr)
+                        .sample(&mut rng, 3.min(alive.len()))
+                }
+            };
+
+            for peer in &targets {
+                let _ = socket.send_to(&bytes, peer).await;
+            }
+
+            counter!("gossip_messages_sent_total").increment(targets.len() as u64);
+        }
+    }
+
+    async fn sender_loop_tiered(
+        store: Arc<CRDTStore>,
+        peer_table: Arc<PeerTable>,
+        node_id: NodeId,
+        seed_peers: Vec<SocketAddr>,
+        base_interval_ms: u64,
+        socket: Arc<UdpSocket>,
+    ) -> tokio::io::Result<()> {
+        // Tick at the fastest tier rate (base / 10)
+        // so high-pressure keys get gossiped promptly
+        let fast_tick = base_interval_ms / 10;
+        let mut ticker = interval(Duration::from_millis(fast_tick));
+
+        // Track when each tier last gossiped
+        // Tiers: [base, 0.75x, 0.5x, 0.25x, 0.1x]
+        let tier_intervals_ms: [u64; 5] = [
+            base_interval_ms,
+            base_interval_ms * 3 / 4,
+            base_interval_ms / 2,
+            base_interval_ms / 4,
+            base_interval_ms / 10,
+        ];
+        let mut tier_last_sent: [tokio::time::Instant; 5] = [tokio::time::Instant::now(); 5];
+
+
+        loop {
+            ticker.tick().await;
+            let now = tokio::time::Instant::now();
+
+            // figure out which tiers are due this tick
+            let mut tiers_due = [false; 5];
+            for (i, &interval_ms) in tier_intervals_ms.iter().enumerate() {
+                if now.duration_since(tier_last_sent[i]).as_millis() >= interval_ms as u128 {
+                    tiers_due[i] = true;
+                    tier_last_sent[i] = now;
+                }
+            }
+            // if no tiers are due, skip
+            if !tiers_due.iter().any(|&d| d) { continue; }
+
+            /*
+                Doing peer merging of seed peers so we don't
+                need to see each peer per node.
+                Just need a full graph of peers and this will propagate through
+                For example, if node1 is seeded with all of the other nodes,
+                and the each other node is seeded with node1, then each node will
+                eventually converge to have their peer set be all other
+                peers in the cluster
+             */
+            let alive = peer_table.get_alive_peers();
+            let peer_entries: Vec<PeerEntry> = alive
+                .iter()
+                .map(|(id, addr)| PeerEntry { node_id: *id, address: *addr })
+                .collect();
+            
+            let deltas = store.take_delta_tiered(&tiers_due);
             if deltas.is_empty() && peer_entries.is_empty() { continue }
 
             // track how many dirty keys per round
@@ -197,6 +321,7 @@ impl GossipEngine {
         let socket = Arc::clone(&self.socket);
         let peer_table_sender_ref = Arc::clone(&self.peer_table);
         let sender_socket = Arc::clone(&self.socket);
+        let strategy = self.gossip_strategy.clone();
 
         let sender_store = Arc::clone(&store);
         tokio::spawn(async move {
@@ -206,6 +331,7 @@ impl GossipEngine {
                 node_id, 
                 peers, 
                 interval_ms,
+                strategy,
                 sender_socket,
             ).await;
         });
@@ -271,16 +397,16 @@ mod tests {
         let table_b = make_peer_table(vec![(NODE_A, addr(19000))]);
 
         let engine_a = GossipEngine::new(
-            Arc::clone(&store_a), NODE_A, vec![addr(19001)], 50, socket_a, table_a,
+            Arc::clone(&store_a), NODE_A, vec![addr(19001)], 50, "fixed".to_string(), socket_a, table_a,
         );
         let engine_b = GossipEngine::new(
-            Arc::clone(&store_b), NODE_B, vec![addr(19000)], 50, socket_b, table_b,
+            Arc::clone(&store_b), NODE_B, vec![addr(19000)], 50, "fixed".to_string(),socket_b, table_b,
         );
 
         engine_a.run().await;
         engine_b.run().await;
 
-        store_a.increment(KEY, EPOCH, NODE_A, 10);
+        store_a.increment(KEY, EPOCH, NODE_A, 10, 0);
         sleep(Duration::from_millis(300)).await;
 
         assert_eq!(store_b.estimated_count(KEY, EPOCH, 1.0), 10.0);
@@ -297,17 +423,17 @@ mod tests {
         let table_b = make_peer_table(vec![(NODE_A, addr(19002))]);
 
         let engine_a = GossipEngine::new(
-            Arc::clone(&store_a), NODE_A, vec![addr(19003)], 50, socket_a, table_a,
+            Arc::clone(&store_a), NODE_A, vec![addr(19003)], 50, "fixed".to_string(),socket_a, table_a,
         );
         let engine_b = GossipEngine::new(
-            Arc::clone(&store_b), NODE_B, vec![addr(19002)], 50, socket_b, table_b,
+            Arc::clone(&store_b), NODE_B, vec![addr(19002)], 50, "fixed".to_string(),socket_b, table_b,
         );
 
         engine_a.run().await;
         engine_b.run().await;
 
-        store_a.increment(KEY, EPOCH, NODE_A, 10);
-        store_b.increment(KEY, EPOCH, NODE_B, 20);
+        store_a.increment(KEY, EPOCH, NODE_A, 10, 0);
+        store_b.increment(KEY, EPOCH, NODE_B, 20, 0);
         sleep(Duration::from_millis(300)).await;
 
         assert_eq!(store_a.estimated_count(KEY, EPOCH, 1.0), 30.0);
@@ -325,10 +451,10 @@ mod tests {
         let table_b = make_peer_table(vec![(NODE_A, addr(19004))]);
 
         let engine_a = GossipEngine::new(
-            Arc::clone(&store_a), NODE_A, vec![addr(19005)], 50, socket_a, table_a,
+            Arc::clone(&store_a), NODE_A, vec![addr(19005)], 50, "fixed".to_string(),socket_a, table_a,
         );
         let engine_b = GossipEngine::new(
-            Arc::clone(&store_b), NODE_B, vec![addr(19004)], 50, socket_b, table_b,
+            Arc::clone(&store_b), NODE_B, vec![addr(19004)], 50, "fixed".to_string(),socket_b, table_b,
         );
 
         engine_a.run().await;

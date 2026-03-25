@@ -24,7 +24,8 @@ pub struct CRDTStore {
     /// (Key_hash, Epoch) -> GCounter
     counters: DashMap<(KeyHash, Epoch), TimestampedGCounter>,
     
-    dirty_set: DashSet<(KeyHash, Epoch)>,
+    // key to gossip tier
+    dirty_set: DashMap<(KeyHash, Epoch), u8>,
 }
 
 /// Conflict free Replicated Data Type Store. This is an API wrapper around a DashMap of GCounters
@@ -32,7 +33,7 @@ impl CRDTStore {
     pub fn new() -> Self {
         CRDTStore {
             counters: DashMap::new(),
-            dirty_set: DashSet::new(),
+            dirty_set: DashMap::new(),
         }
     }
 
@@ -42,14 +43,12 @@ impl CRDTStore {
     }
 
     /// Takes key_hash and epoch and increments the counter for this key
-    pub fn increment(&self, key_hash: KeyHash, epoch: Epoch, node_id: NodeId, hits: u64) {
+    pub fn increment(&self, key_hash: KeyHash, epoch: Epoch, node_id: NodeId, hits: u64, tier: u8) {
         let key = (key_hash, epoch);
-
         let mut entry = self.counters.entry(key).or_default();
         entry.last_accessed = Instant::now();
         entry.counter.increment(node_id, hits);
-        
-        self.dirty_set.insert(key);
+        self.dirty_set.insert(key, tier);
     }
 
     /// Merge a counter with a remote counter (one way merge, remote_counter is not mutated)
@@ -64,7 +63,7 @@ impl CRDTStore {
 
     /// Returns all of the dirty keys
     pub fn take_delta(&self) -> Vec<((KeyHash, Epoch), GCounter)> {
-        let dirty_keys: Vec<_> = self.dirty_set.iter().map(|key| *key).collect();
+        let dirty_keys: Vec<_> = self.dirty_set.iter().map(|entry| *entry.key()).collect();
         self.dirty_set.clear();
 
         dirty_keys.into_iter()
@@ -72,6 +71,24 @@ impl CRDTStore {
                 self.counters.get(&key).map(|c| (key, c.counter.clone()))
             })
             .collect()
+    }
+
+    // tiered delta taking
+    pub fn take_delta_tiered(&self, tiers_due: &[bool; 5]) -> Vec<((KeyHash, Epoch), GCounter)> {
+        let mut deltas = vec![];
+
+        self.dirty_set.retain(|key_pair, tier| {
+            if tiers_due[*tier as usize] {
+                if let Some(counter) = self.counters.get(key_pair) {
+                    deltas.push((*key_pair, counter.counter.clone()));
+                }
+                false
+            } else {
+                true
+            }
+        });
+
+        deltas
     }
 
     /// Sliding window read: current + previous * (1 - elapsed_frac)
@@ -136,23 +153,23 @@ mod tests {
     #[test]
     fn increment_and_read() {
         let store = CRDTStore::new();
-        store.increment(KEY, EPOCH, NODE_A, 10);
+        store.increment(KEY, EPOCH, NODE_A, 10, 0);
         assert_eq!(store.estimated_count(KEY, EPOCH, 0.0), 10.0);
     }
 
     #[test]
     fn increment_multiple_nodes() {
         let store = CRDTStore::new();
-        store.increment(KEY, EPOCH, NODE_A, 10);
-        store.increment(KEY, EPOCH, NODE_B, 20);
+        store.increment(KEY, EPOCH, NODE_A, 10, 0);
+        store.increment(KEY, EPOCH, NODE_B, 20, 0);
         assert_eq!(store.estimated_count(KEY, EPOCH, 0.0), 30.0);
     }
 
     #[test]
     fn different_keys_are_independent() {
         let store = CRDTStore::new();
-        store.increment(100, EPOCH, NODE_A, 5);
-        store.increment(200, EPOCH, NODE_A, 15);
+        store.increment(100, EPOCH, NODE_A, 5, 0);
+        store.increment(200, EPOCH, NODE_A, 15, 0);
         assert_eq!(store.estimated_count(100, EPOCH, 0.0), 5.0);
         assert_eq!(store.estimated_count(200, EPOCH, 0.0), 15.0);
     }
@@ -160,8 +177,8 @@ mod tests {
     #[test]
     fn different_epochs_are_independent() {
         let store = CRDTStore::new();
-        store.increment(KEY, 1, NODE_A, 10);
-        store.increment(KEY, 2, NODE_A, 20);
+        store.increment(KEY, 1, NODE_A, 10, 0);
+        store.increment(KEY, 2, NODE_A, 20, 0);
 
         assert_eq!(store.estimated_count(KEY, 1, 1.0), 10.0);
         assert_eq!(store.estimated_count(KEY, 2, 1.0), 20.0);
@@ -170,7 +187,7 @@ mod tests {
     #[test]
     fn merge_remote_updates_count() {
         let store = CRDTStore::new();
-        store.increment(KEY, EPOCH, NODE_A, 10);
+        store.increment(KEY, EPOCH, NODE_A, 10, 0);
 
         let mut remote = GCounter::new();
         remote.increment(NODE_B, 20);
@@ -194,7 +211,7 @@ mod tests {
     #[test]
     fn increment_marks_dirty() {
         let store = CRDTStore::new();
-        store.increment(KEY, EPOCH, NODE_A, 5);
+        store.increment(KEY, EPOCH, NODE_A, 5, 0);
 
         let delta = store.take_delta();
         assert_eq!(delta.len(), 1);
@@ -204,7 +221,7 @@ mod tests {
     #[test]
     fn take_delta_clears_dirty() {
         let store = CRDTStore::new();
-        store.increment(KEY, EPOCH, NODE_A, 5);
+        store.increment(KEY, EPOCH, NODE_A, 5, 0);
 
         let first = store.take_delta();
         assert_eq!(first.len(), 1);
@@ -216,8 +233,8 @@ mod tests {
     #[test]
     fn sliding_window_start_of_epoch() {
         let store = CRDTStore::new();
-        store.increment(KEY, 41, NODE_A, 100);
-        store.increment(KEY, 42, NODE_A, 10);
+        store.increment(KEY, 41, NODE_A, 100, 0);
+        store.increment(KEY, 42, NODE_A, 10, 0);
 
         assert_eq!(store.estimated_count(KEY, 42, 0.0), 110.0);
     }
@@ -225,8 +242,8 @@ mod tests {
     #[test]
     fn sliding_window_end_of_epoch() {
         let store = CRDTStore::new();
-        store.increment(KEY, 41, NODE_A, 100);
-        store.increment(KEY, 42, NODE_A, 10);
+        store.increment(KEY, 41, NODE_A, 100, 0);
+        store.increment(KEY, 42, NODE_A, 10, 0);
 
         assert_eq!(store.estimated_count(KEY, 42, 1.0), 10.0);
     }
@@ -234,8 +251,8 @@ mod tests {
     #[test]
     fn sliding_window_midpoint() {
         let store = CRDTStore::new();
-        store.increment(KEY, 41, NODE_A, 100);
-        store.increment(KEY, 42, NODE_A, 10);
+        store.increment(KEY, 41, NODE_A, 100, 0);
+        store.increment(KEY, 42, NODE_A, 10, 0);
 
         assert_eq!(store.estimated_count(KEY, 42, 0.5), 60.0);
     }
@@ -249,7 +266,7 @@ mod tests {
     #[test]
     fn no_previous_epoch_data() {
         let store = CRDTStore::new();
-        store.increment(KEY, 42, NODE_A, 50);
+        store.increment(KEY, 42, NODE_A, 50, 0);
 
         assert_eq!(store.estimated_count(KEY, 42, 0.0), 50.0);
         assert_eq!(store.estimated_count(KEY, 42, 0.5), 50.0);
@@ -259,7 +276,7 @@ mod tests {
     #[test]
     fn eviction_removes_old_entries() {
         let store = CRDTStore::new();
-        store.increment(KEY, EPOCH, NODE_A, 10);
+        store.increment(KEY, EPOCH, NODE_A, 10, 0);
 
         store.evict(Duration::from_secs(0));
 
@@ -269,7 +286,7 @@ mod tests {
     #[test]
     fn eviction_keeps_recent_entries() {
         let store = CRDTStore::new();
-        store.increment(KEY, EPOCH, NODE_A, 10);
+        store.increment(KEY, EPOCH, NODE_A, 10, 0);
 
         store.evict(Duration::from_secs(3600));
 
