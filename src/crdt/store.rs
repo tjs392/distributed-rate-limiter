@@ -74,7 +74,7 @@ impl CRDTStore {
     }
 
     // tiered delta taking
-    pub fn take_delta_tiered(&self, tiers_due: &[bool; 5]) -> Vec<((KeyHash, Epoch), GCounter)> {
+    pub fn take_delta_tiered(&self, tiers_due: &[bool]) -> Vec<((KeyHash, Epoch), GCounter)> {
         let mut deltas = vec![];
 
         self.dirty_set.retain(|key_pair, tier| {

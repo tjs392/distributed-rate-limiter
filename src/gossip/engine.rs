@@ -53,12 +53,30 @@ impl GossipEngine {
         strategy: String,
         socket: Arc<UdpSocket>,
     ) -> tokio::io::Result<()> {
+        let t = base_interval_ms;
         match strategy.as_str() {
+            "binary" => Self::sender_loop_tiered(
+                store, peer_table, node_id, seed_peers,
+                &[t, t / 10],
+                socket,
+            ).await,
+            "3tier" => Self::sender_loop_tiered(
+                store, peer_table, node_id, seed_peers,
+                &[t, t / 2, t / 10],
+                socket,
+            ).await,
             "tiered" => Self::sender_loop_tiered(
-                store, peer_table, node_id, seed_peers, base_interval_ms, socket
+                store, peer_table, node_id, seed_peers,
+                &[t, t * 3 / 4, t / 2, t / 4, t / 10],
+                socket,
+            ).await,
+            "8tier" | "continuous" => Self::sender_loop_tiered(
+                store, peer_table, node_id, seed_peers,
+                &[t, t * 7 / 8, t * 6 / 8, t * 5 / 8, t * 4 / 8, t * 3 / 8, t * 2 / 8, t / 10],
+                socket,
             ).await,
             _ => Self::sender_loop_fixed(
-                store, peer_table, node_id, seed_peers, base_interval_ms, socket
+                store, peer_table, node_id, seed_peers, base_interval_ms, socket,
             ).await,
         }
     }
@@ -145,100 +163,51 @@ impl GossipEngine {
         peer_table: Arc<PeerTable>,
         node_id: NodeId,
         seed_peers: Vec<SocketAddr>,
-        base_interval_ms: u64,
+        tier_intervals_ms: &[u64],
         socket: Arc<UdpSocket>,
     ) -> tokio::io::Result<()> {
-        // Tick at the fastest tier rate (base / 10)
-        // so high-pressure keys get gossiped promptly
-        let fast_tick = base_interval_ms / 10;
+        let fast_tick = tier_intervals_ms.iter().copied().min().unwrap_or(100);
         let mut ticker = interval(Duration::from_millis(fast_tick));
-
-        // Track when each tier last gossiped
-        // Tiers: [base, 0.75x, 0.5x, 0.25x, 0.1x]
-        let tier_intervals_ms: [u64; 5] = [
-            base_interval_ms,
-            base_interval_ms * 3 / 4,
-            base_interval_ms / 2,
-            base_interval_ms / 4,
-            base_interval_ms / 10,
-        ];
-        let mut tier_last_sent: [tokio::time::Instant; 5] = [tokio::time::Instant::now(); 5];
-
+        let mut tier_last_sent: Vec<tokio::time::Instant> = vec![tokio::time::Instant::now(); tier_intervals_ms.len()];
 
         loop {
             ticker.tick().await;
             let now = tokio::time::Instant::now();
 
-            // figure out which tiers are due this tick
-            let mut tiers_due = [false; 5];
+            let mut tiers_due = vec![false; tier_intervals_ms.len()];
             for (i, &interval_ms) in tier_intervals_ms.iter().enumerate() {
                 if now.duration_since(tier_last_sent[i]).as_millis() >= interval_ms as u128 {
                     tiers_due[i] = true;
                     tier_last_sent[i] = now;
                 }
             }
-            // if no tiers are due, skip
             if !tiers_due.iter().any(|&d| d) { continue; }
 
-            /*
-                Doing peer merging of seed peers so we don't
-                need to see each peer per node.
-                Just need a full graph of peers and this will propagate through
-                For example, if node1 is seeded with all of the other nodes,
-                and the each other node is seeded with node1, then each node will
-                eventually converge to have their peer set be all other
-                peers in the cluster
-             */
             let alive = peer_table.get_alive_peers();
             let peer_entries: Vec<PeerEntry> = alive
                 .iter()
                 .map(|(id, addr)| PeerEntry { node_id: *id, address: *addr })
                 .collect();
-            
+
             let deltas = store.take_delta_tiered(&tiers_due);
             if deltas.is_empty() && peer_entries.is_empty() { continue }
 
-            // track how many dirty keys per round
             gauge!("gossip_delta_size").set(deltas.len() as f64);
 
-            /*
-                The GossipEngine packages up all of the dirtry (change)
-                gcounter on its node and sends out the updates to its peers
-                over UDP
-
-                The peers then unwrap the copied gcounters and merge their
-                "deltas" with their own gcounters per hash/epoch
-             */
-            let msg = GossipMessage {
-                sender_id: node_id,
-                updates: deltas,
-                peers: peer_entries,
-            };
-
-
-            // rmp_serde = rust message pack, binary, compact, faster than regular
-            // serde_json this uses MessagePack format
+            let msg = GossipMessage { sender_id: node_id, updates: deltas, peers: peer_entries };
             let bytes = match rmp_serde::to_vec(&msg) {
                 Ok(b) => b,
                 Err(_) => continue,
             };
-            
-            let targets: Vec<SocketAddr> = {
-                let alive_addrs: Vec<SocketAddr> = alive.iter().map(|(_, addr)| *addr).collect();
-                if alive_addrs.is_empty() {
-                    seed_peers.clone()
-                } else {
-                    let mut rng = rand::rng();
-                    alive.iter()
-                        .map(|(_, addr)| *addr)
-                        .sample(&mut rng, 3.min(alive.len()))
-                }
+
+            let targets: Vec<SocketAddr> = if alive.is_empty() {
+                seed_peers.clone()
+            } else {
+                let mut rng = rand::rng();
+                alive.iter().map(|(_, addr)| *addr).sample(&mut rng, 3.min(alive.len()))
             };
 
-            for peer in &targets {
-                let _ = socket.send_to(&bytes, peer).await;
-            }
-
+            for peer in &targets { let _ = socket.send_to(&bytes, peer).await; }
             counter!("gossip_messages_sent_total").increment(targets.len() as u64);
         }
     }

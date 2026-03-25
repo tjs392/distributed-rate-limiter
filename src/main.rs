@@ -124,7 +124,7 @@ async fn main() {
         ).await;
     });
 
-    let limiter = Arc::new(Limiter::new(Arc::clone(&store), Arc::clone(&disk_store), node_id));
+    let limiter = Arc::new(Limiter::new(Arc::clone(&store), Arc::clone(&disk_store), node_id, cfg.gossip.strategy.clone()));
     let rules = Arc::new(rules::loader::load(&cfg.rules_file));
     
     // Set up the gRPC server for envoy

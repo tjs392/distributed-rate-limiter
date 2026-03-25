@@ -31,6 +31,35 @@ struct HealthResponse {
     node_id: u128,
 }
 
+#[derive(Deserialize)]
+struct EstimateRequest {
+    key: String,
+    limit: u64,
+    window_ms: u64,
+}
+
+#[derive(Serialize)]
+struct EstimateResponse {
+    estimate: f64,
+    remaining: f64,
+    pressure: f64,
+}
+
+async fn estimate_handler(
+    State(limiter): State<Arc<Limiter>>,
+    Json(body): Json<EstimateRequest>,
+) -> Json<EstimateResponse> {
+    let estimate = limiter.estimate(&body.key, body.window_ms);
+    let remaining = body.limit as f64 - estimate;
+    let pressure = estimate / body.limit as f64;
+
+    Json(EstimateResponse {
+        estimate,
+        remaining,
+        pressure,
+    })
+}
+
 async fn check_handler(
     State(limiter): State<Arc<Limiter>>,
     Json(body): Json<CheckRequest>,
@@ -75,6 +104,7 @@ async fn health_handler(
 pub fn create_router(limiter: Arc<Limiter>) -> Router {
     Router::new()
         .route("/check", post(check_handler))
+        .route("/estimate", post(estimate_handler))
         .route("/health", get(health_handler))
         .with_state(limiter)
 }
@@ -111,7 +141,7 @@ mod tests {
         let _ = fs::remove_file(&path);
         let store = Arc::new(CRDTStore::new());
         let disk_store = Arc::new(DiskStore::new(&path));
-        let limiter = Arc::new(Limiter::new(store, disk_store, 1));
+        let limiter = Arc::new(Limiter::new(store, disk_store, 1, "fixed".to_string()));
         create_router(limiter)
     }
 

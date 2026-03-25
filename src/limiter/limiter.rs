@@ -17,15 +17,22 @@ pub struct Limiter {
     store: Arc<CRDTStore>,
     disk_store: Arc<DiskStore>,
     node_id: NodeId,
+    strategy: String,
 }
 
 /// Limiter receives a ref to the CRDTStore so it can do operations
 impl Limiter {
-    pub fn new(store: Arc<CRDTStore>, disk_store: Arc<DiskStore>, node_id: NodeId) -> Self {
+    pub fn new(
+        store: Arc<CRDTStore>, 
+        disk_store: Arc<DiskStore>, 
+        node_id: NodeId, 
+        strategy: String
+    ) -> Self {
         Limiter {
             store,
             disk_store,
             node_id,
+            strategy,
         }
     }
 
@@ -73,13 +80,43 @@ impl Limiter {
             counter!("rate_limit_checks_total", "result" => "deny").increment(1);
             RateLimitResult::Deny { retry_after_ms: (epoch + 1) * window_ms - now_ms }
         } else {
-            let pressure = estimate / limit as f64;
-            let tier = match pressure {
-                p if p >= 0.90 => 4u8,
-                p if p >= 0.75 => 3,
-                p if p >= 0.50 => 2,
-                p if p >= 0.25 => 1,
-                _ => 0,
+            let pressure = (estimate + hits as f64) / limit as f64;
+            let tier = match self.strategy.as_str() {
+                "binary" => match pressure {
+                    p if p >= 0.80 => 1u8,
+                    _ => 0,
+                },
+                "3tier" => match pressure {
+                    p if p >= 0.85 => 2u8,
+                    p if p >= 0.50 => 1,
+                    _ => 0,
+                },
+                "8tier" => match pressure {
+                    p if p >= 0.875 => 7u8,
+                    p if p >= 0.750 => 6,
+                    p if p >= 0.625 => 5,
+                    p if p >= 0.500 => 4,
+                    p if p >= 0.375 => 3,
+                    p if p >= 0.250 => 2,
+                    p if p >= 0.125 => 1,
+                    _ => 0,
+                },
+                "continuous" => {
+                    // interval = base * (1 - p^2), mapped to 8 tiers
+                    // tier 0 = slowest (p near 0), tier 7 = fastest (p near 1)
+                    let alpha: f64 = 2.0;
+                    let curve = (pressure.min(1.0)).powf(alpha);
+                    // curve ranges 0..1, map to tiers 0..7
+                    (curve * 7.0).round() as u8
+                },
+                // "tiered" and default: existing 5-tier boundaries
+                _ => match pressure {
+                    p if p >= 0.90 => 4u8,
+                    p if p >= 0.75 => 3,
+                    p if p >= 0.50 => 2,
+                    p if p >= 0.25 => 1,
+                    _ => 0,
+                },
             };
 
             self.store.increment(key_hash, epoch, self.node_id, hits, tier);
@@ -90,6 +127,30 @@ impl Limiter {
         histogram!("rate_limit_check_duration_seconds").record(start.elapsed().as_secs_f64());
 
         result
+    }
+
+    pub fn estimate(&self, key: &str, window_ms: u64) -> f64 {
+        let key_hash = xxh3_64(key.as_bytes());
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let epoch = now_ms / window_ms;
+        let elapsed_frac = (now_ms % window_ms) as f64 / window_ms as f64;
+
+        let mut estimate = self.store.estimated_count(key_hash, epoch, elapsed_frac);
+
+        if estimate == 0.0 {
+            if let Some(counter) = self.disk_store.get(key_hash, epoch) {
+                self.store.merge_remote(key_hash, epoch, &counter);
+            }
+            if let Some(counter) = self.disk_store.get(key_hash, epoch.saturating_sub(1)) {
+                self.store.merge_remote(key_hash, epoch.saturating_sub(1), &counter);
+            }
+            estimate = self.store.estimated_count(key_hash, epoch, elapsed_frac);
+        }
+
+        estimate
     }
 }
 
@@ -116,7 +177,7 @@ mod tests {
         let path = format!("/tmp/test_limiter_{}.redb", name);
         let _ = fs::remove_file(&path);
         let disk_store = Arc::new(DiskStore::new(&path));
-        Limiter::new(Arc::new(CRDTStore::new()), disk_store, NODE)
+        Limiter::new(Arc::new(CRDTStore::new()), disk_store, NODE, "fixed".to_string())
     }
 
     #[test]
