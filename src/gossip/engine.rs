@@ -169,6 +169,8 @@ impl GossipEngine {
                         .sample(&mut rng, 3.min(alive.len()))
                 }
             };
+            
+            counter!("gossip_bytes_sent_total").increment(bytes.len() as u64);
 
             for peer in &targets {
                 let _ = socket.send_to(&bytes, peer).await;
@@ -210,6 +212,13 @@ impl GossipEngine {
                 .collect();
 
             let deltas = store.take_delta_tiered(&tiers_due);
+
+            // track round utility
+            counter!("gossip_rounds_total").increment(1);
+            if deltas.is_empty() {
+                counter!("gossip_rounds_empty_total").increment(1);
+            }
+
             if deltas.is_empty() && peer_entries.is_empty() { continue }
 
             gauge!("gossip_delta_size").set(deltas.len() as f64);
@@ -226,6 +235,8 @@ impl GossipEngine {
                 let mut rng = rand::rng();
                 alive.iter().map(|(_, addr)| *addr).sample(&mut rng, 3.min(alive.len()))
             };
+            
+            counter!("gossip_bytes_sent_total").increment(bytes.len() as u64);
 
             for peer in &targets { let _ = socket.send_to(&bytes, peer).await; }
             counter!("gossip_messages_sent_total").increment(targets.len() as u64);
@@ -407,7 +418,7 @@ mod tests {
         engine_a.run().await;
         engine_b.run().await;
 
-        store_a.increment(KEY, EPOCH, NODE_A, 10, 0);
+        store_a.increment(KEY, EPOCH, NODE_A, 10, 0, 0.3);
         sleep(Duration::from_millis(300)).await;
 
         assert_eq!(store_b.estimated_count(KEY, EPOCH, 1.0), 10.0);
@@ -441,8 +452,8 @@ mod tests {
         engine_a.run().await;
         engine_b.run().await;
 
-        store_a.increment(KEY, EPOCH, NODE_A, 10, 0);
-        store_b.increment(KEY, EPOCH, NODE_B, 20, 0);
+        store_a.increment(KEY, EPOCH, NODE_A, 10, 0, 0.3);
+        store_b.increment(KEY, EPOCH, NODE_B, 20, 0, 0.3);
         sleep(Duration::from_millis(300)).await;
 
         assert_eq!(store_a.estimated_count(KEY, EPOCH, 1.0), 30.0);

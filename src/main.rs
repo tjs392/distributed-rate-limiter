@@ -132,6 +132,8 @@ async fn main() {
         cfg.gossip.tier_count,
         cfg.gossip.alpha,
         cfg.gossip.continuous,
+        cfg.gossip.velocity_weight,
+        cfg.gossip.velocity_alpha,
     ));
 
     let rules = Arc::new(rules::loader::load(&cfg.rules_file));

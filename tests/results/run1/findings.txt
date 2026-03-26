@@ -1,0 +1,97 @@
+PRESSURE-TIERED GOSSIP: PRELIMINARY BENCHMARK FINDINGS
+Teiji Schoyen | Drexel University | March 2026
+=======================================================
+
+SETUP
+-----
+Cluster:       5 nodes, local machine (ThinkPad)
+Rate limit:    1000 req / 60s window
+Gossip base:   200ms interval
+Strategies:    fixed, binary, 3tier, tiered (5tier), 8tier, continuous
+Load levels:   75%, 100%, 200%, 300%, 400% of rate limit
+Iterations:    5 per pressure level per strategy
+Metric:        Over-admission ratio = (allowed - limit) / limit
+               Convergence p75 = time for 3 of 4 observer nodes to reach
+               80% of sent count after burst
+
+
+MEAN OVER-ADMISSION RATIO BY STRATEGY
+--------------------------------------
+Strategy       200%     300%     400%
+fixed          90.4%    96.2%    95.8%   <- baseline
+binary         92.3%    87.1%   102.2%
+3tier          80.7%    77.9%    76.7%
+tiered (5t)    80.2%    94.7%    99.5%
+8tier          62.5%    78.9%    64.3%   <- best overall
+continuous     94.7%   100.1%    70.1%
+
+All strategies: 0% over-admission at 75% and 100% load (below limit).
+Convergence times at 300%+ are not meaningful (saturation regime,
+all nodes hit limit from local decisions alone before gossip fires).
+
+
+KEY FINDINGS
+------------
+1. 8tier is the best-performing strategy overall.
+   At 200% load it reduces over-admission by ~31% vs fixed (62.5% vs 90.4%).
+   At 400% load it reduces over-admission by ~33% vs fixed (64.3% vs 95.8%).
+   This challenges the original prediction that 5 tiers would be the sweet
+   spot -- tier count alone does not determine performance.
+
+2. 3tier is the most stable strategy across load levels.
+   OA ratio is 80.7% / 77.9% / 76.7% at 200/300/400% load -- low variance
+   and consistent improvement over fixed at every level. Good
+   cost/benefit tradeoff for practitioners who want predictability.
+
+3. Binary confirms the thundering herd problem empirically.
+   At 400% load, binary is WORSE than fixed (102.2% vs 95.8%). This is
+   the Spotify threshold-crossing problem: many keys crossing the 80%
+   boundary simultaneously creates a burst of fast-tier gossip that
+   contends rather than helps. This is a publishable negative result.
+
+4. The OA reduction curve is not monotonic.
+   8tier > continuous > 3tier > tiered (5tier) > binary > fixed at 200%.
+   More tiers does not simply mean better performance. Tier boundary
+   placement matters as much as tier count.
+
+5. Continuous underperforms at moderate overload.
+   At 200% load continuous is 94.7% -- worse than fixed. The pressure^2
+   curve with alpha=2.0 reacts too slowly at moderate pressure. At 400%
+   it recovers to 70.1%. Alpha tuning or revised tier boundary mapping
+   for the continuous-to-discrete approximation is needed.
+
+6. Tiered (5tier) regresses at high load.
+   5tier was the original implementation and performed well in early runs
+   but shows 94.7% / 99.5% OA at 300/400% load -- worse than 3tier and
+   8tier. High iteration variance suggests tier boundary oscillation under
+   sustained burst. Needs a rerun with more iterations to confirm.
+
+
+OPEN QUESTIONS
+--------------
+- Is the 5tier regression at 300-400% reproducible or run-to-run noise?
+  Rerun with ITERATIONS=15 to confirm.
+
+- Why does 8tier outperform continuous? The continuous tier mapping
+  (pressure^2 * 7 -> tier index) produces much lower tier assignments
+  at moderate pressure than 8tier's evenly-spaced boundaries. The
+  comparison is not apples-to-apples. Fix the continuous mapping to
+  match 8tier intervals before drawing conclusions.
+
+- Does improvement scale with N? All results are at N=5 (local cluster).
+  The over-admission bound O_max = R * T_convergence * (N-1)/N grows
+  with N. The benefit of tiered gossip should be more pronounced at
+  N=25, N=50, N=100. Cloud cluster runs needed to confirm.
+
+- What is the bandwidth cost of each strategy? OA reduction is only
+  half the story. 8tier gossips faster for more keys, which increases
+  aggregate UDP traffic. Not yet measured.
+
+
+NEXT STEPS
+----------
+1. Fix continuous tier mapping to use same interval boundaries as 8tier.
+2. Rerun tiered (5tier) and continuous with ITERATIONS=15.
+3. Add bandwidth measurement to benchmark (bytes/s per node from metrics).
+4. Run on GCP/AWS at N=25 and N=100 to validate scale behavior.
+5. Begin drafting Section 7.3 (How Many Tiers?) using these results.

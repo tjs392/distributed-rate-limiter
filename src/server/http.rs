@@ -141,7 +141,7 @@ mod tests {
         let _ = fs::remove_file(&path);
         let store = Arc::new(CRDTStore::new());
         let disk_store = Arc::new(DiskStore::new(&path));
-        let limiter = Arc::new(Limiter::new(store, disk_store, 1, 1, 2.0, false));
+        let limiter = Arc::new(Limiter::new(store, disk_store, 1, 1, 2.0, false, 0.4, 0.3));
         create_router(limiter)
     }
 

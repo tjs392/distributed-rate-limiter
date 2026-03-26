@@ -20,6 +20,8 @@ pub struct Limiter {
     tier_count: usize,
     alpha: f64,
     continuous: bool,
+    velocity_weight: f64,
+    velocity_alpha:  f64,
 }
 
 /// Limiter receives a ref to the CRDTStore so it can do operations
@@ -31,8 +33,18 @@ impl Limiter {
         tier_count: usize,
         alpha: f64,
         continuous: bool,
+        velocity_weight: f64,
+        velocity_alpha: f64,
     ) -> Self {
-        Limiter { store, disk_store, node_id, tier_count, alpha, continuous }
+        Limiter { 
+            store, 
+            disk_store, 
+            node_id, 
+            tier_count, 
+            alpha, 
+            continuous, 
+            velocity_weight, 
+            velocity_alpha }
     }
 
     pub fn node_id(&self) -> NodeId {
@@ -79,10 +91,21 @@ impl Limiter {
             counter!("rate_limit_checks_total", "result" => "deny").increment(1);
             RateLimitResult::Deny { retry_after_ms: (epoch + 1) * window_ms - now_ms }
         } else {
-            let pressure = (estimate + hits as f64) / limit as f64;
+            let instantaneous = (estimate + hits as f64) / limit as f64;
+
+            let effective_pressure = if self.velocity_weight > 0.0 {
+                let vel_hits_per_ms = self.store.velocity(key_hash);
+                let normalized_velocity = (vel_hits_per_ms * window_ms as f64 / limit as f64).min(1.0);
+                let w2 = self.velocity_weight;
+                let w1 = 1.0 - w2;
+                (w1 * instantaneous + w2 * normalized_velocity).min(1.0)
+            } else {
+                instantaneous.min(1.0)
+            };
+
             let boundaries = Self::compute_tier_boundaries(self.tier_count);
-            let tier = Self::pressure_to_tier(pressure, &boundaries);
-            self.store.increment(key_hash, epoch, self.node_id, hits, tier);
+            let tier = Self::pressure_to_tier(effective_pressure, &boundaries);
+            self.store.increment(key_hash, epoch, self.node_id, hits, tier, self.velocity_alpha);
 
             counter!("rate_limit_checks_total", "result" => "allow").increment(1);
             RateLimitResult::Allow { remaining: (limit as f64 - estimate - hits as f64) as u64 }
@@ -155,7 +178,7 @@ mod tests {
         let path = format!("/tmp/test_limiter_{}.redb", name);
         let _ = fs::remove_file(&path);
         let disk_store = Arc::new(DiskStore::new(&path));
-        Limiter::new(Arc::new(CRDTStore::new()), disk_store, NODE, 1, 2.0, false)
+        Limiter::new(Arc::new(CRDTStore::new()), disk_store, NODE, 1, 2.0, false, 0.4, 0.3)
     }
 
     #[test]

@@ -38,10 +38,15 @@ pub struct GossipConfig {
     pub alpha: f64,
     #[serde(default)]
     pub continuous: bool,
+    #[serde(default)]
+    pub velocity_weight: f64,
+    #[serde(default = "default_velocity_alpha")]
+    pub velocity_alpha: f64,
 }
 
 fn default_tier_count() -> usize { 5 }
 fn default_alpha() -> f64 { 2.0 }
+fn default_velocity_alpha() -> f64 { 0.3 }
 
 #[derive(Deserialize)]
 pub struct ServerConfig {
