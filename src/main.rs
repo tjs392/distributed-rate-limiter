@@ -44,7 +44,6 @@ async fn main() {
     println!("loading config from: {}", args.config);
 
     let cfg = config::load(&args.config);
-    println!("node {} starting with gossip strategy: {}", cfg.node.id, cfg.gossip.strategy);
 
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", cfg.server.gossip_port).parse().unwrap();
     let http_addr: SocketAddr = format!("0.0.0.0:{}", cfg.server.http_port).parse().unwrap();
@@ -75,7 +74,9 @@ async fn main() {
         node_id,
         peers,
         cfg.gossip.interval_ms,
-        cfg.gossip.strategy.clone(),
+        cfg.gossip.tier_count,
+        cfg.gossip.alpha,
+        cfg.gossip.continuous,
         Arc::clone(&gossip_socket),
         Arc::clone(&peer_table),
     );
@@ -124,7 +125,15 @@ async fn main() {
         ).await;
     });
 
-    let limiter = Arc::new(Limiter::new(Arc::clone(&store), Arc::clone(&disk_store), node_id, cfg.gossip.strategy.clone()));
+    let limiter = Arc::new(Limiter::new(
+        Arc::clone(&store),
+        Arc::clone(&disk_store),
+        node_id,
+        cfg.gossip.tier_count,
+        cfg.gossip.alpha,
+        cfg.gossip.continuous,
+    ));
+
     let rules = Arc::new(rules::loader::load(&cfg.rules_file));
     
     // Set up the gRPC server for envoy

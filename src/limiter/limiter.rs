@@ -17,23 +17,22 @@ pub struct Limiter {
     store: Arc<CRDTStore>,
     disk_store: Arc<DiskStore>,
     node_id: NodeId,
-    strategy: String,
+    tier_count: usize,
+    alpha: f64,
+    continuous: bool,
 }
 
 /// Limiter receives a ref to the CRDTStore so it can do operations
 impl Limiter {
     pub fn new(
-        store: Arc<CRDTStore>, 
-        disk_store: Arc<DiskStore>, 
-        node_id: NodeId, 
-        strategy: String
+        store: Arc<CRDTStore>,
+        disk_store: Arc<DiskStore>,
+        node_id: NodeId,
+        tier_count: usize,
+        alpha: f64,
+        continuous: bool,
     ) -> Self {
-        Limiter {
-            store,
-            disk_store,
-            node_id,
-            strategy,
-        }
+        Limiter { store, disk_store, node_id, tier_count, alpha, continuous }
     }
 
     pub fn node_id(&self) -> NodeId {
@@ -81,45 +80,10 @@ impl Limiter {
             RateLimitResult::Deny { retry_after_ms: (epoch + 1) * window_ms - now_ms }
         } else {
             let pressure = (estimate + hits as f64) / limit as f64;
-            let tier = match self.strategy.as_str() {
-                "binary" => match pressure {
-                    p if p >= 0.80 => 1u8,
-                    _ => 0,
-                },
-                "3tier" => match pressure {
-                    p if p >= 0.85 => 2u8,
-                    p if p >= 0.50 => 1,
-                    _ => 0,
-                },
-                "8tier" => match pressure {
-                    p if p >= 0.875 => 7u8,
-                    p if p >= 0.750 => 6,
-                    p if p >= 0.625 => 5,
-                    p if p >= 0.500 => 4,
-                    p if p >= 0.375 => 3,
-                    p if p >= 0.250 => 2,
-                    p if p >= 0.125 => 1,
-                    _ => 0,
-                },
-                "continuous" => {
-                    // interval = base * (1 - p^2), mapped to 8 tiers
-                    // tier 0 = slowest (p near 0), tier 7 = fastest (p near 1)
-                    let alpha: f64 = 2.0;
-                    let curve = (pressure.min(1.0)).powf(alpha);
-                    // curve ranges 0..1, map to tiers 0..7
-                    (curve * 7.0).round() as u8
-                },
-                // "tiered" and default: existing 5-tier boundaries
-                _ => match pressure {
-                    p if p >= 0.90 => 4u8,
-                    p if p >= 0.75 => 3,
-                    p if p >= 0.50 => 2,
-                    p if p >= 0.25 => 1,
-                    _ => 0,
-                },
-            };
-
+            let boundaries = Self::compute_tier_boundaries(self.tier_count);
+            let tier = Self::pressure_to_tier(pressure, &boundaries);
             self.store.increment(key_hash, epoch, self.node_id, hits, tier);
+
             counter!("rate_limit_checks_total", "result" => "allow").increment(1);
             RateLimitResult::Allow { remaining: (limit as f64 - estimate - hits as f64) as u64 }
         };
@@ -127,6 +91,20 @@ impl Limiter {
         histogram!("rate_limit_check_duration_seconds").record(start.elapsed().as_secs_f64());
 
         result
+    }
+
+    /// computes pressure boundaries for each tier chosen from value K
+    /// 
+    /// k = 3 [0.0, 0.33, 0.67]
+    fn compute_tier_boundaries(k: usize) -> Vec<f64> {
+        (0..k).map(|i| i as f64 / k as f64).collect()
+    }
+
+    /// just returns current key's pressure tier it's in
+    fn pressure_to_tier(pressure: f64, boundaries: &[f64]) -> u8 {
+        boundaries.iter()
+            .rposition(|&b| pressure >= b)
+            .unwrap_or(0) as u8
     }
 
     pub fn estimate(&self, key: &str, window_ms: u64) -> f64 {
@@ -177,7 +155,7 @@ mod tests {
         let path = format!("/tmp/test_limiter_{}.redb", name);
         let _ = fs::remove_file(&path);
         let disk_store = Arc::new(DiskStore::new(&path));
-        Limiter::new(Arc::new(CRDTStore::new()), disk_store, NODE, "fixed".to_string())
+        Limiter::new(Arc::new(CRDTStore::new()), disk_store, NODE, 1, 2.0, false)
     }
 
     #[test]

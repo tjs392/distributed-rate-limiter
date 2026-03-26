@@ -32,13 +32,16 @@ pub struct NodeConfig {
 #[derive(Deserialize)]
 pub struct GossipConfig {
     pub interval_ms: u64,
-    #[serde(default = "default_strategy")]
-    pub strategy: String,
+    #[serde(default = "default_tier_count")]
+    pub tier_count: usize,
+    #[serde(default = "default_alpha")]
+    pub alpha: f64,
+    #[serde(default)]
+    pub continuous: bool,
 }
 
-fn default_strategy() -> String {
-    "tiered".to_string()
-}
+fn default_tier_count() -> usize { 5 }
+fn default_alpha() -> f64 { 2.0 }
 
 #[derive(Deserialize)]
 pub struct ServerConfig {

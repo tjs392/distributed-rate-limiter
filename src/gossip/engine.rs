@@ -18,7 +18,9 @@ pub struct GossipEngine {
     node_id: NodeId,
     peer_addresses: Vec<SocketAddr>,
     gossip_interval: u64,
-    gossip_strategy: String,
+    tier_count: usize,
+    alpha: f64,
+    continuous: bool,
     socket: Arc<UdpSocket>,
     peer_table: Arc<PeerTable>,
 }
@@ -29,17 +31,21 @@ impl GossipEngine {
         node_id: NodeId,
         peer_addresses: Vec<SocketAddr>,
         gossip_interval: u64,
-        gossip_strategy: String,
+        tier_count: usize,
+        alpha: f64,
+        continuous: bool,
         socket: Arc<UdpSocket>,
         peer_table: Arc<PeerTable>,
     ) -> Self {
         GossipEngine {
-            store,
-            node_id,
+            store, 
+            node_id, 
             peer_addresses,
-            gossip_interval,
-            gossip_strategy,
-            socket,
+            gossip_interval, 
+            tier_count, 
+            alpha, 
+            continuous,
+            socket, 
             peer_table,
         }
     }
@@ -50,35 +56,49 @@ impl GossipEngine {
         node_id: NodeId,
         seed_peers: Vec<SocketAddr>,
         base_interval_ms: u64,
-        strategy: String,
+        tier_count: usize,
+        alpha: f64,
+        continuous: bool,
         socket: Arc<UdpSocket>,
     ) -> tokio::io::Result<()> {
-        let t = base_interval_ms;
-        match strategy.as_str() {
-            "binary" => Self::sender_loop_tiered(
-                store, peer_table, node_id, seed_peers,
-                &[t, t / 10],
-                socket,
-            ).await,
-            "3tier" => Self::sender_loop_tiered(
-                store, peer_table, node_id, seed_peers,
-                &[t, t / 2, t / 10],
-                socket,
-            ).await,
-            "tiered" => Self::sender_loop_tiered(
-                store, peer_table, node_id, seed_peers,
-                &[t, t * 3 / 4, t / 2, t / 4, t / 10],
-                socket,
-            ).await,
-            "8tier" | "continuous" => Self::sender_loop_tiered(
-                store, peer_table, node_id, seed_peers,
-                &[t, t * 7 / 8, t * 6 / 8, t * 5 / 8, t * 4 / 8, t * 3 / 8, t * 2 / 8, t / 10],
-                socket,
-            ).await,
-            _ => Self::sender_loop_fixed(
-                store, peer_table, node_id, seed_peers, base_interval_ms, socket,
-            ).await,
-        }
+        let intervals = Self::compute_tier_intervals(base_interval_ms, tier_count, alpha, continuous);
+        Self::sender_loop_tiered(
+            store, peer_table, node_id, seed_peers, &intervals, socket,
+        ).await
+    }
+
+    /// alpha controls the shape of the curve that maps pressure to gossip interval
+    /// 
+    /// inteval(p) = base * (1 - p&alpha)
+    /// 
+    /// at p = 0, interval = base. at p = 1, interval = 0
+    /// 
+    /// alpha = 1.0? => linear: gossip speeds up at a constant rate as pressure increase
+    /// 
+    /// alpha = 2.0? => quadratic: gossip stays low until pressure is high, then speeds up quickly
+    /// 
+    /// alpha = 0.5? => gossip speeds up aggressively at low pressure
+    /// 
+    /// Example: (k=3, base=200ms, alpha=2.0), 
+    /// 
+    /// tier 0 midpoint = 0.167 -> 200 * (1 - 0.167^2) = 194ms
+    /// 
+    /// tier 1 midpoint = 0.500 -> 200 * (1 - 0.500^2) = 200 * 0.750 = 150ms
+    /// 
+    /// tier 2 midpoint = 0.833 -> 200 * (1 - 0.833^2) = 200 * 0.306 =  61ms
+    fn compute_tier_intervals(base_ms: u64, k: usize, alpha: f64, continuous: bool) -> Vec<u64> {
+        let floor = base_ms / 10;
+        (0..k).map(|i| {
+            let p = if continuous {
+                // sample the curve at the midpoint of each tier's pressure band
+                (i as f64 + 0.5) / k as f64
+            } else {
+                // evenly spaced: tier i fires at i/(k-1) of the way from base to floor
+                if k == 1 { 0.0 } else { i as f64 / (k - 1) as f64 }
+            };
+            let interval = base_ms as f64 * (1.0 - p.powf(alpha));
+            (interval as u64).max(floor)
+        }).collect()
     }
 
     async fn sender_loop_fixed(
@@ -290,17 +310,21 @@ impl GossipEngine {
         let socket = Arc::clone(&self.socket);
         let peer_table_sender_ref = Arc::clone(&self.peer_table);
         let sender_socket = Arc::clone(&self.socket);
-        let strategy = self.gossip_strategy.clone();
+        let tier_count = self.tier_count;
+        let alpha = self.alpha;
+        let continuous = self.continuous;
 
         let sender_store = Arc::clone(&store);
         tokio::spawn(async move {
             let _ = Self::sender_loop(
-                sender_store, 
-                peer_table_sender_ref, 
-                node_id, 
-                peers, 
+                sender_store,
+                peer_table_sender_ref,
+                node_id,
+                peers,
                 interval_ms,
-                strategy,
+                tier_count,
+                alpha,
+                continuous,
                 sender_socket,
             ).await;
         });
@@ -366,10 +390,18 @@ mod tests {
         let table_b = make_peer_table(vec![(NODE_A, addr(19000))]);
 
         let engine_a = GossipEngine::new(
-            Arc::clone(&store_a), NODE_A, vec![addr(19001)], 50, "fixed".to_string(), socket_a, table_a,
+            Arc::clone(&store_a), NODE_A, vec![addr(19001)], 50,
+            1,
+            2.0,
+            false,
+            socket_a, table_a,
         );
         let engine_b = GossipEngine::new(
-            Arc::clone(&store_b), NODE_B, vec![addr(19000)], 50, "fixed".to_string(),socket_b, table_b,
+            Arc::clone(&store_b), NODE_B, vec![addr(19000)], 50, 
+            1,
+            2.0,
+            false,
+            socket_b, table_b,
         );
 
         engine_a.run().await;
@@ -392,10 +424,18 @@ mod tests {
         let table_b = make_peer_table(vec![(NODE_A, addr(19002))]);
 
         let engine_a = GossipEngine::new(
-            Arc::clone(&store_a), NODE_A, vec![addr(19003)], 50, "fixed".to_string(),socket_a, table_a,
+            Arc::clone(&store_a), NODE_A, vec![addr(19001)], 50,
+            1,
+            2.0,
+            false,
+            socket_a, table_a,
         );
         let engine_b = GossipEngine::new(
-            Arc::clone(&store_b), NODE_B, vec![addr(19002)], 50, "fixed".to_string(),socket_b, table_b,
+            Arc::clone(&store_b), NODE_B, vec![addr(19000)], 50, 
+            1,
+            2.0,
+            false,
+            socket_b, table_b,
         );
 
         engine_a.run().await;
@@ -420,10 +460,18 @@ mod tests {
         let table_b = make_peer_table(vec![(NODE_A, addr(19004))]);
 
         let engine_a = GossipEngine::new(
-            Arc::clone(&store_a), NODE_A, vec![addr(19005)], 50, "fixed".to_string(),socket_a, table_a,
+            Arc::clone(&store_a), NODE_A, vec![addr(19001)], 50,
+            1,
+            2.0,
+            false,
+            socket_a, table_a,
         );
         let engine_b = GossipEngine::new(
-            Arc::clone(&store_b), NODE_B, vec![addr(19004)], 50, "fixed".to_string(),socket_b, table_b,
+            Arc::clone(&store_b), NODE_B, vec![addr(19000)], 50, 
+            1,
+            2.0,
+            false,
+            socket_b, table_b,
         );
 
         engine_a.run().await;
