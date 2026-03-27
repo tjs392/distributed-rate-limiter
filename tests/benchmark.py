@@ -1,678 +1,460 @@
 #!/usr/bin/env python3
 """
-plot_results.py
-Generates plots from convergence benchmark CSV results.
-
-Usage:
-    python3 plot_results.py
-    python3 plot_results.py --csv path/to/convergence_combined.csv
+Convergence benchmark for pressure-tiered gossip.
+Strategies are defined as (tier_count, alpha, continuous, velocity_weight, velocity_alpha) tuples.
+tier_count=1 is fixed behavior, continuous=True uses curve sampling.
 """
 
-import argparse
+import asyncio
+import aiohttp
+import time
+import random
+import csv
 import os
+import subprocess
 import sys
 import statistics
-import math
+import re
 
-try:
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import matplotlib.ticker as mticker
-except ImportError:
-    print("ERROR: matplotlib not installed. Run: pip install matplotlib")
-    sys.exit(1)
-
-import csv
-
-# ── Config ────────────────────────────────────────────────────────────────────
-
-SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_CSV = os.path.join(SCRIPT_DIR, "results", "convergence_combined.csv")
-PLOTS_DIR   = os.path.join(SCRIPT_DIR, "results", "plots")
-
-# Base strategies without velocity — ordered by tier count for diminishing-returns plots
-BASE_STRATEGY_ORDER = [
-    "tiered_1",
-    "tiered_2",
-    "tiered_3",
-    "tiered_5",
-    "tiered_8",
-    "tiered_12",
-    "continuous_k8",
+NODES = [
+    "http://localhost:8080",
+    "http://localhost:8081",
+    "http://localhost:8082",
+    "http://localhost:8083",
+    "http://localhost:8084",
 ]
 
-VELOCITY_STRATEGIES = [
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
+CONFIG_DIR  = os.path.join(PROJECT_DIR, "config")
+RESULTS_DIR = os.path.join(SCRIPT_DIR, "results")
+RESTART_SCRIPT = os.path.join(SCRIPT_DIR, "restart.sh")
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+LIMIT              = 1000
+WINDOW_MS          = 60000
+PRESSURE_LEVELS    = [2000, 3000, 4000]
+ITERATIONS         = 5
+POLL_INTERVAL_MS   = 10
+CONVERGENCE_TIMEOUT_S = 30
+METRICS_PORTS = [9090, 9091, 9092, 9093, 9094]
+
+# (tier_count, alpha, continuous, velocity_weight, velocity_alpha)
+STRATEGIES = [
+    # baselines
+    (1,  2.0, False, 0.0, 0.3),   # fixed
+    (2,  2.0, False, 0.0, 0.3),   # binary
+    (5,  2.0, False, 0.0, 0.3),   # 5tier baseline
+    (8,  2.0, False, 0.0, 0.3),   # 8tier baseline
+    (8,  2.0, True,  0.0, 0.3),   # continuous baseline
     # velocity weight sweep (tiered_8, alpha_ema=0.3)
-    "tiered_8_v0.2_va0.3",
-    "tiered_8_v0.4_va0.3",
-    "tiered_8_v0.6_va0.3",
-    "tiered_8_v0.8_va0.3",
-    "tiered_8_v1.0_va0.3",
+    (8,  2.0, False, 0.2, 0.3),
+    (8,  2.0, False, 0.4, 0.3),
+    (8,  2.0, False, 0.6, 0.3),
+    (8,  2.0, False, 0.8, 0.3),
+    (8,  2.0, False, 1.0, 0.3),
     # EMA alpha sweep (tiered_8, velocity_weight=0.6)
-    "tiered_8_v0.6_va0.1",
-    "tiered_8_v0.6_va0.5",
-    "tiered_8_v0.6_va0.7",
-    "tiered_8_v0.6_va0.9",
+    (8,  2.0, False, 0.6, 0.1),
+    (8,  2.0, False, 0.6, 0.5),
+    (8,  2.0, False, 0.6, 0.7),
+    (8,  2.0, False, 0.6, 0.9),
     # tier count sweep (velocity_weight=0.6, alpha_ema=0.3)
-    "tiered_2_v0.6_va0.3",
-    "tiered_3_v0.6_va0.3",
-    "tiered_5_v0.6_va0.3",
-    "tiered_12_v0.6_va0.3",
-    # existing
-    "tiered_5_v0.4_va0.3",
-    "continuous_k8_v0.4_va0.3",
+    (2,  2.0, False, 0.6, 0.3),
+    (3,  2.0, False, 0.6, 0.3),
+    (5,  2.0, False, 0.6, 0.3),
+    (12, 2.0, False, 0.6, 0.3),
+    # continuous + velocity
+    (8,  2.0, True,  0.4, 0.3),
 ]
 
-TIER_COUNTS = {
-    "tiered_1":               1,
-    "tiered_2":               2,
-    "tiered_5":               5,
-    "tiered_8":               8,
-    "continuous_k8":          8,
-    "tiered_5_v0.4_va0.3":   5,
-    "tiered_8_v0.2_va0.3":   8,
-    "tiered_8_v0.4_va0.3":   8,
-    "tiered_8_v0.6_va0.3":   8,
-    "continuous_k8_v0.4_va0.3": 8,
-}
 
-STRATEGY_LABELS = {
-    "tiered_1":                  "Fixed (1 tier)",
-    "tiered_2":                  "Binary (2 tiers)",
-    "tiered_5":                  "5 Tiers",
-    "tiered_8":                  "8 Tiers",
-    "continuous_k8":             "Continuous (k=8)",
-    "tiered_5_v0.4_va0.3":      "5 Tiers + vel(0.4)",
-    "tiered_8_v0.2_va0.3":      "8 Tiers + vel(0.2)",
-    "tiered_8_v0.4_va0.3":      "8 Tiers + vel(0.4)",
-    "tiered_8_v0.6_va0.3":      "8 Tiers + vel(0.6)",
-    "continuous_k8_v0.4_va0.3": "Continuous + vel(0.4)",
-}
-
-COLORS = {
-    "tiered_1":                  "#4878CF",
-    "tiered_2":                  "#D65F5F",
-    "tiered_5":                  "#6ACC65",
-    "tiered_8":                  "#B47CC7",
-    "continuous_k8":             "#888888",
-    "tiered_5_v0.4_va0.3":      "#3DAA5C",
-    "tiered_8_v0.2_va0.3":      "#E0A0F0",
-    "tiered_8_v0.4_va0.3":      "#9B30D0",
-    "tiered_8_v0.6_va0.3":      "#5B0090",
-    "continuous_k8_v0.4_va0.3": "#444444",
-}
-
-SENTINEL = 30000.0
-LIMIT    = 1000
-
-
-# ── Data loading ──────────────────────────────────────────────────────────────
-
-def load_csv(path):
-    rows = []
-    with open(path, newline="") as f:
-        for row in csv.DictReader(f):
-            def flt(k, default=None):
-                v = row.get(k, "")
-                if v == "" or v is None:
-                    return default
-                try:
-                    return float(v)
-                except:
-                    return default
-
-            row["pressure"]             = flt("pressure", 0)
-            row["requests"]             = int(row.get("requests", 0))
-            row["iteration"]            = int(row.get("iteration", 0))
-            row["allowed"]              = int(row.get("allowed", 0))
-            row["denied"]               = int(row.get("denied", 0))
-            row["over_admission_count"] = int(row.get("over_admission_count", 0))
-            row["over_admission_ratio"] = flt("over_admission_ratio", 0)
-            row["p75_ms"]               = flt("p75_ms", SENTINEL)
-            row["max_ms"]               = flt("max_ms", SENTINEL)
-            row["first_propagation_ms"] = flt("first_propagation_ms", SENTINEL)
-            row["gossip_bytes"]         = flt("gossip_bytes", 0)
-            row["gossip_msgs"]          = flt("gossip_msgs", 0)
-            row["gossip_rounds"]        = flt("gossip_rounds", 0)
-            row["empty_rounds"]         = flt("empty_rounds", 0)
-            row["useful_ratio"]         = flt("useful_ratio", 0)
-            row["cpu_pct"]              = flt("cpu_pct", 0)
-            row["velocity_weight"]      = flt("velocity_weight", 0)
-            row["velocity_alpha"]       = flt("velocity_alpha", 0.3)
-            rows.append(row)
-    return rows
-
-
-def group_by(rows, key):
-    out = {}
-    for row in rows:
-        out.setdefault(row[key], []).append(row)
-    return out
-
-
-def mean_std(values):
-    if not values:
-        return 0.0, 0.0
-    m = statistics.mean(values)
-    s = statistics.stdev(values) if len(values) > 1 else 0.0
-    return m, s
-
-
-def all_strategy_order(rows):
-    """Return strategies in a consistent order: base first, velocity variants after."""
-    seen = {r["strategy"] for r in rows}
-    ordered = [s for s in BASE_STRATEGY_ORDER if s in seen]
-    ordered += [s for s in VELOCITY_STRATEGIES if s in seen]
-    # catch anything not in either list
-    ordered += sorted(s for s in seen if s not in ordered)
-    return ordered
-
-
-def pressure_levels(rows):
-    return sorted({r["requests"] for r in rows})
-
-
-# ── Plot helpers ──────────────────────────────────────────────────────────────
-
-def save(fig, name):
-    os.makedirs(PLOTS_DIR, exist_ok=True)
-    path = os.path.join(PLOTS_DIR, name)
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  saved → {path}")
-
-
-def pressure_label(requests):
-    return f"{round(requests / LIMIT * 100)}%"
-
-
-# ── Plot 1: OA ratio by pressure, base strategies only ───────────────────────
-
-def plot_oa_by_pressure(rows):
-    strategies = [s for s in all_strategy_order(rows) if s in BASE_STRATEGY_ORDER]
-    levels     = pressure_levels(rows)
-    by_strat   = group_by(rows, "strategy")
-
-    fig, ax = plt.subplots(figsize=(9, 5))
-    for s in strategies:
-        xs, ys, errs = [], [], []
-        for req in levels:
-            vals = [r["over_admission_ratio"] for r in by_strat.get(s, []) if r["requests"] == req]
-            if vals:
-                m, sd = mean_std(vals)
-                xs.append(req / LIMIT * 100)
-                ys.append(m * 100)
-                errs.append(sd * 100)
-        ax.errorbar(xs, ys, yerr=errs, label=label(s), color=color(s),
-                    marker="o", linewidth=2, markersize=5, capsize=3)
-
-    ax.set_xlabel("Load (% of rate limit)", fontsize=11)
-    ax.set_ylabel("Over-admission ratio (%)", fontsize=11)
-    ax.set_title("Over-Admission Ratio — Base Strategies", fontsize=12)
-    ax.xaxis.set_major_formatter(mticker.FormatStrFormatter("%g%%"))
-    ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%g%%"))
-    ax.axvline(100, color="gray", linestyle="--", linewidth=1, alpha=0.5)
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    save(fig, "01_oa_base_strategies.png")
-
-
-# ── Plot 2: OA ratio — velocity strategies vs their base counterparts ─────────
-
-def plot_oa_velocity_comparison(rows):
-    """
-    Side-by-side: base 8tier and 5tier vs their velocity variants.
-    Shows whether velocity improves OA.
-    """
-    compare_groups = [
-        ("tiered_8", [
-            "tiered_8_v0.2_va0.3",
-            "tiered_8_v0.4_va0.3",
-            "tiered_8_v0.6_va0.3",
-            "tiered_8_v0.8_va0.3",
-            "tiered_8_v1.0_va0.3",
-        ]),
-        ("tiered_5", [
-            "tiered_5_v0.4_va0.3",
-            "tiered_5_v0.6_va0.3",
-        ]),
-        ("continuous_k8", [
-            "continuous_k8_v0.4_va0.3",
-        ]),
-    ]
-
-    levels   = pressure_levels(rows)
-    by_strat = group_by(rows, "strategy")
-    present  = {r["strategy"] for r in rows}
-
-    fig, axes = plt.subplots(1, len(compare_groups), figsize=(7 * len(compare_groups), 5), squeeze=False)
-
-    for gi, (base, variants) in enumerate(compare_groups):
-        ax = axes[0][gi]
-        for s in [base] + variants:
-            if s not in present:
-                continue
-            xs, ys, errs = [], [], []
-            for req in levels:
-                vals = [r["over_admission_ratio"] for r in by_strat.get(s, []) if r["requests"] == req]
-                if vals:
-                    m, sd = mean_std(vals)
-                    xs.append(req / LIMIT * 100)
-                    ys.append(m * 100)
-                    errs.append(sd * 100)
-            lw = 2.5 if s == base else 1.5
-            ls = "-" if s == base else "--"
-            ax.errorbar(xs, ys, yerr=errs, label=label(s), color=color(s),
-                        marker="o", linewidth=lw, linestyle=ls, markersize=5, capsize=3)
-
-        ax.set_xlabel("Load (% of rate limit)", fontsize=10)
-        ax.set_ylabel("OA ratio (%)", fontsize=10)
-        ax.set_title(f"{label(base)} — velocity comparison", fontsize=11)
-        ax.xaxis.set_major_formatter(mticker.FormatStrFormatter("%g%%"))
-        ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%g%%"))
-        ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
-
-    fig.suptitle("Velocity-Aware vs Baseline — OA Ratio", fontsize=13)
-    fig.tight_layout()
-    save(fig, "02_oa_velocity_comparison.png")
-
-
-# ── Plot 3: First propagation latency ─────────────────────────────────────────
-
-def plot_first_propagation(rows):
-    """
-    Mean first_propagation_ms per strategy at each pressure level.
-    Sentinels excluded. This directly shows promotion latency effect.
-    """
-    strategies = all_strategy_order(rows)
-    levels     = pressure_levels(rows)
-    by_strat   = group_by(rows, "strategy")
-
-    real_levels = [req for req in levels
-                   if any(r["first_propagation_ms"] < SENTINEL
-                          for s in strategies
-                          for r in by_strat.get(s, [])
-                          if r["requests"] == req)]
-    if not real_levels:
-        print("  [skip] all first_propagation values are sentinels")
-        return
-
-    fig, ax = plt.subplots(figsize=(10, 5))
-    for s in strategies:
-        xs, ys, errs = [], [], []
-        for req in real_levels:
-            vals = [r["first_propagation_ms"]
-                    for r in by_strat.get(s, [])
-                    if r["requests"] == req and r["first_propagation_ms"] < SENTINEL]
-            if vals:
-                m, sd = mean_std(vals)
-                xs.append(req / LIMIT * 100)
-                ys.append(m)
-                errs.append(sd)
-        if xs:
-            lw = 2.5 if s in BASE_STRATEGY_ORDER else 1.5
-            ls = "-" if s in BASE_STRATEGY_ORDER else "--"
-            ax.errorbar(xs, ys, yerr=errs, label=label(s), color=color(s),
-                        marker="o", linewidth=lw, linestyle=ls, markersize=5, capsize=3)
-
-    ax.set_xlabel("Load (% of rate limit)", fontsize=11)
-    ax.set_ylabel("First propagation latency (ms)", fontsize=11)
-    ax.set_title("First Propagation Latency — Sentinels Excluded", fontsize=12)
-    ax.xaxis.set_major_formatter(mticker.FormatStrFormatter("%g%%"))
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    save(fig, "03_first_propagation_latency.png")
-
-
-# ── Plot 4: Bytes efficiency — bytes sent per OA reduction point ──────────────
-
-def plot_bytes_efficiency(rows):
-    """
-    For each strategy at each pressure level:
-    x = mean gossip_bytes, y = OA reduction vs fixed.
-    Shows bandwidth efficiency — lower-left is better.
-    """
-    strategies = all_strategy_order(rows)
-    levels     = [req for req in pressure_levels(rows) if req > LIMIT]
-    by_strat   = group_by(rows, "strategy")
-    fixed_rows = by_strat.get("tiered_1", [])
-
-    if not fixed_rows:
-        print("  [skip] bytes efficiency plot needs tiered_1 as baseline")
-        return
-
-    ncols = min(len(levels), 3)
-    nrows = math.ceil(len(levels) / ncols)
-    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 5 * nrows), squeeze=False)
-
-    for idx, req in enumerate(levels):
-        ax = axes[idx // ncols][idx % ncols]
-        f_oa = statistics.mean(r["over_admission_ratio"] for r in fixed_rows if r["requests"] == req)
-        f_oa = f_oa if f_oa > 0 else None
-
-        for s in strategies:
-            s_rows = [r for r in by_strat.get(s, []) if r["requests"] == req]
-            if not s_rows or not f_oa:
-                continue
-            s_oa    = statistics.mean(r["over_admission_ratio"] for r in s_rows)
-            s_bytes = statistics.mean(r["gossip_bytes"] for r in s_rows)
-            reduction = (f_oa - s_oa) / f_oa * 100
-
-            mk = "o" if s in BASE_STRATEGY_ORDER else "^"
-            ax.scatter(s_bytes, reduction, color=color(s), s=80, marker=mk, zorder=5)
-            ax.annotate(label(s), (s_bytes, reduction),
-                        textcoords="offset points", xytext=(5, 3), fontsize=7, color=color(s))
-
-        ax.set_xlabel("Mean gossip bytes per iteration", fontsize=10)
-        ax.set_ylabel("OA reduction vs fixed (%)", fontsize=10)
-        ax.set_title(f"Bytes Efficiency at {pressure_label(req)} load", fontsize=11)
-        ax.grid(True, alpha=0.3)
-        ax.axhline(0, color="gray", linewidth=0.8, alpha=0.5)
-
-    for idx in range(len(levels), nrows * ncols):
-        axes[idx // ncols][idx % ncols].set_visible(False)
-
-    fig.suptitle("Bandwidth Efficiency — Less bytes, more OA reduction = better (lower-left)", fontsize=12)
-    fig.tight_layout()
-    save(fig, "04_bytes_efficiency.png")
-
-
-# ── Plot 5: Velocity weight sweep — OA vs velocity_weight for tiered_8 ───────
-
-def get_tier_count(s):
-    lookup = {
-        "tiered_1": 1, "tiered_2": 2, "tiered_3": 3, "tiered_5": 5,
-        "tiered_8": 8, "tiered_12": 12, "continuous_k8": 8,
-    }
-    if s in lookup:
-        return lookup[s]
-    parts = s.split("_")
-    for p in parts:
-        if p.isdigit():
-            return int(p)
-    return 0
-
-
-def plot_velocity_sweep(rows):
-    levels   = [req for req in pressure_levels(rows) if req > LIMIT]
-    by_strat = group_by(rows, "strategy")
-    level_colors = ["#D65F5F", "#E6A817", "#4878CF", "#6ACC65"]
-
-    fig, axes = plt.subplots(1, 3, figsize=(21, 5))
-
-    # --- subplot 1: velocity weight sweep (tiered_8, va=0.3) ---
-    ax = axes[0]
-    weight_strats = sorted(
-        [s for s in by_strat if "tiered_8" in s and "va0.3" in s],
-        key=lambda s: float(s.split("_v")[1].split("_")[0]) if "_v" in s else 0
-    )
-    for li, req in enumerate(levels):
-        xs, ys = [], []
-        for s in weight_strats:
-            s_rows = [r for r in by_strat[s] if r["requests"] == req]
-            if s_rows:
-                vw = statistics.mean(r["velocity_weight"] for r in s_rows)
-                oa = statistics.mean(r["over_admission_ratio"] for r in s_rows) * 100
-                xs.append(vw)
-                ys.append(oa)
-        if xs:
-            paired = sorted(zip(xs, ys))
-            ax.plot([p[0] for p in paired], [p[1] for p in paired],
-                    marker="o", linewidth=2, markersize=6,
-                    color=level_colors[li % len(level_colors)],
-                    label=f"{pressure_label(req)} load")
-        # binary reference
-        b_rows = [r for r in by_strat.get("tiered_2", []) if r["requests"] == req]
-        if b_rows:
-            b_oa = statistics.mean(r["over_admission_ratio"] for r in b_rows) * 100
-            ax.axhline(b_oa, color=level_colors[li % len(level_colors)],
-                       linestyle=":", linewidth=1, alpha=0.5)
-
-    ax.set_xlabel("Velocity weight (w2)", fontsize=10)
-    ax.set_ylabel("Mean OA ratio (%)", fontsize=10)
-    ax.set_title("OA vs Velocity Weight\n(tiered_8, α_ema=0.3, dotted=binary)", fontsize=10)
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.3)
-
-    # --- subplot 2: EMA alpha sweep (tiered_8, vw=0.6) ---
-    ax = axes[1]
-    alpha_strats = sorted(
-        [s for s in by_strat if "tiered_8_v0.6" in s],
-        key=lambda s: float(s.split("_va")[1]) if "_va" in s else 0
-    )
-    for li, req in enumerate(levels):
-        xs, ys = [], []
-        for s in alpha_strats:
-            s_rows = [r for r in by_strat[s] if r["requests"] == req]
-            if s_rows:
-                va = statistics.mean(r["velocity_alpha"] for r in s_rows)
-                oa = statistics.mean(r["over_admission_ratio"] for r in s_rows) * 100
-                xs.append(va)
-                ys.append(oa)
-        if xs:
-            paired = sorted(zip(xs, ys))
-            ax.plot([p[0] for p in paired], [p[1] for p in paired],
-                    marker="s", linewidth=2, markersize=6,
-                    color=level_colors[li % len(level_colors)],
-                    label=f"{pressure_label(req)} load")
-
-    ax.set_xlabel("EMA alpha (velocity smoothing)", fontsize=10)
-    ax.set_ylabel("Mean OA ratio (%)", fontsize=10)
-    ax.set_title("OA vs EMA Alpha\n(tiered_8, velocity_weight=0.6)", fontsize=10)
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.3)
-
-    # --- subplot 3: tier count sweep (vw=0.6, va=0.3) ---
-    ax = axes[2]
-    tier_strats = sorted(
-        [s for s in by_strat if "_v0.6_va0.3" in s or s in ("tiered_1", "tiered_2")],
-        key=lambda s: get_tier_count(s)
-    )
-    for li, req in enumerate(levels):
-        xs, ys = [], []
-        for s in tier_strats:
-            s_rows = [r for r in by_strat[s] if r["requests"] == req]
-            if s_rows:
-                tc = get_tier_count(s)
-                oa = statistics.mean(r["over_admission_ratio"] for r in s_rows) * 100
-                xs.append(tc)
-                ys.append(oa)
-        if xs:
-            paired = sorted(zip(xs, ys))
-            ax.plot([p[0] for p in paired], [p[1] for p in paired],
-                    marker="^", linewidth=2, markersize=6,
-                    color=level_colors[li % len(level_colors)],
-                    label=f"{pressure_label(req)} load")
-
-    ax.set_xlabel("Tier count (k)", fontsize=10)
-    ax.set_ylabel("Mean OA ratio (%)", fontsize=10)
-    ax.set_title("OA vs Tier Count\n(velocity_weight=0.6, α_ema=0.3)", fontsize=10)
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.3)
-
-    fig.suptitle("Velocity Parameter Sweep", fontsize=13)
-    fig.tight_layout()
-    save(fig, "05_velocity_parameter_sweep.png")
-
-
-# ── Plot 6: OA heatmap — all strategies × pressure ───────────────────────────
-
-def plot_oa_heatmap(rows):
+def strategy_label(tier_count, alpha, continuous, velocity_weight, velocity_alpha):
+    base = f"continuous_k{tier_count}" if continuous else f"tiered_{tier_count}"
+    if velocity_weight > 0.0:
+        return f"{base}_v{velocity_weight}_va{velocity_alpha}"
+    return base
+
+
+def log(msg):
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def set_strategy(tier_count, alpha, continuous, velocity_weight, velocity_alpha):
+    cont_str = "true" if continuous else "false"
+    for fname in os.listdir(CONFIG_DIR):
+        if not fname.endswith(".toml"):
+            continue
+        path = os.path.join(CONFIG_DIR, fname)
+        with open(path, "r") as f:
+            content = f.read()
+        content = re.sub(r'tier_count\s*=\s*\d+',        f'tier_count = {tier_count}',           content)
+        content = re.sub(r'alpha\s*=\s*[\d.]+',           f'alpha = {alpha}',                     content)
+        content = re.sub(r'continuous\s*=\s*\w+',         f'continuous = {cont_str}',              content)
+        content = re.sub(r'velocity_weight\s*=\s*[\d.]+', f'velocity_weight = {velocity_weight}',  content)
+        content = re.sub(r'velocity_alpha\s*=\s*[\d.]+',  f'velocity_alpha = {velocity_alpha}',    content)
+        with open(path, "w") as f:
+            f.write(content)
+    log(f"Set configs to {strategy_label(tier_count, alpha, continuous, velocity_weight, velocity_alpha)}")
+
+
+def restart_cluster():
+    log("Restarting cluster...")
+    subprocess.run(["bash", RESTART_SCRIPT], capture_output=True, timeout=120)
+    import urllib.request
+    for i in range(15):
+        try:
+            resp = urllib.request.urlopen("http://localhost:8080/health", timeout=2)
+            if b"node_id" in resp.read():
+                time.sleep(3)
+                log("Cluster ready")
+                return True
+        except:
+            pass
+        time.sleep(1)
+    log("WARNING: cluster not ready")
+    return False
+
+
+def read_cpu_times():
+    with open("/proc/stat") as f:
+        line = f.readline()
+    fields = line.split()
+    idle  = int(fields[4])
+    total = sum(int(x) for x in fields[1:8])
+    return idle, total
+
+
+def cpu_percent(before, after):
+    idle_delta  = after[0] - before[0]
+    total_delta = after[1] - before[1]
+    if total_delta == 0:
+        return 0.0
+    return round((1 - idle_delta / total_delta) * 100, 1)
+
+
+async def scrape_metric(session, port, metric_name):
     try:
-        import numpy as np
-    except ImportError:
-        print("  [skip] heatmap requires numpy")
+        async with session.get(
+            f"http://localhost:{port}/metrics",
+            timeout=aiohttp.ClientTimeout(total=2)
+        ) as resp:
+            text = await resp.text()
+            for line in text.splitlines():
+                if line.startswith(metric_name) and not line.startswith("#"):
+                    return float(line.split()[-1])
+    except:
+        return None
+    return None
+
+
+async def scrape_gossip_msgs(session):
+    total = 0.0
+    for port in METRICS_PORTS:
+        val = await scrape_metric(session, port, "gossip_messages_sent_total")
+        if val is not None:
+            total += val
+    return total
+
+
+async def scrape_gossip_bytes(session):
+    total = 0.0
+    for port in METRICS_PORTS:
+        val = await scrape_metric(session, port, "gossip_bytes_sent_total")
+        if val is not None:
+            total += val
+    return total
+
+
+async def scrape_gossip_rounds(session):
+    total = 0.0
+    empty = 0.0
+    for port in METRICS_PORTS:
+        t = await scrape_metric(session, port, "gossip_rounds_total")
+        e = await scrape_metric(session, port, "gossip_rounds_empty_total")
+        if t is not None:
+            total += t
+        if e is not None:
+            empty += e
+    return total, empty
+
+
+async def send_requests_distributed(session, key, count):
+    MAX_CONCURRENCY = 500
+    sem = asyncio.Semaphore(MAX_CONCURRENCY)
+
+    async def one_request():
+        async with sem:
+            try:
+                async with session.post(
+                    f"{random.choice(NODES)}/check",
+                    json={"key": key, "limit": LIMIT, "hits": 1, "window_ms": WINDOW_MS},
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as resp:
+                    body = await resp.json()
+                    return body.get("status") == 200
+            except Exception:
+                return None
+
+    results = await asyncio.gather(*[one_request() for _ in range(count)])
+    allowed = sum(1 for r in results if r is True)
+    denied  = sum(1 for r in results if r is False)
+    return allowed, denied
+
+
+async def get_estimate(session, node, key):
+    try:
+        async with session.post(f"{node}/estimate", json={
+            "key": key, "limit": LIMIT, "window_ms": WINDOW_MS,
+        }, timeout=aiohttp.ClientTimeout(total=2)) as resp:
+            body = await resp.json()
+            return body.get("estimate", 0.0)
+    except:
+        return None
+
+
+async def measure_convergence(session, num_requests):
+    key = f"bench_{random.randint(0, 2**63)}"
+
+    burst_start = time.monotonic()
+    allowed, denied = await send_requests_distributed(session, key, num_requests)
+    burst_duration_ms = (time.monotonic() - burst_start) * 1000
+    send_done = time.monotonic()
+
+    over_admission_count = max(0, allowed - LIMIT)
+    over_admission_ratio = over_admission_count / LIMIT
+
+    observers = NODES[1:]
+    converged = [False] * len(observers)
+    convergence_times     = [CONVERGENCE_TIMEOUT_S * 1000.0] * len(observers)
+    convergence_pressures = [None] * len(observers)
+    threshold = num_requests * 0.8
+    deadline  = send_done + CONVERGENCE_TIMEOUT_S
+
+    while time.monotonic() < deadline:
+        if all(converged):
+            break
+        checks = []
+        for i, node in enumerate(observers):
+            if not converged[i]:
+                checks.append((i, asyncio.create_task(get_estimate(session, node, key))))
+        for i, task in checks:
+            estimate = await task
+            if estimate is not None and estimate >= threshold:
+                converged[i] = True
+                convergence_times[i]     = (time.monotonic() - send_done) * 1000
+                convergence_pressures[i] = round(estimate / LIMIT, 3)
+        await asyncio.sleep(POLL_INTERVAL_MS / 1000)
+
+    sorted_times = sorted(convergence_times)
+    return {
+        "pressure":             num_requests / LIMIT,
+        "requests":             num_requests,
+        "allowed":              allowed,
+        "denied":               denied,
+        "over_admission_count": over_admission_count,
+        "over_admission_ratio": round(over_admission_ratio, 4),
+        "burst_duration_ms":    round(burst_duration_ms, 1),
+        "node2_ms":             round(convergence_times[0], 1),
+        "node3_ms":             round(convergence_times[1], 1),
+        "node4_ms":             round(convergence_times[2], 1),
+        "node5_ms":             round(convergence_times[3], 1),
+        "node2_pressure":       convergence_pressures[0],
+        "node3_pressure":       convergence_pressures[1],
+        "node4_pressure":       convergence_pressures[2],
+        "node5_pressure":       convergence_pressures[3],
+        "p75_ms":               round(sorted_times[2], 1),
+        "max_ms":               round(sorted_times[3], 1),
+        "first_propagation_ms": round(min(convergence_times), 1),
+    }
+
+
+async def run_benchmark(tier_count, alpha, continuous, velocity_weight, velocity_alpha):
+    label = strategy_label(tier_count, alpha, continuous, velocity_weight, velocity_alpha)
+    log(f"Benchmarking {label}")
+    results = []
+
+    connector = aiohttp.TCPConnector(limit=500)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        try:
+            async with session.get(
+                f"{NODES[0]}/health", timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp:
+                if resp.status != 200:
+                    log("ERROR: cluster not healthy")
+                    return results
+        except Exception as e:
+            log(f"ERROR: {e}")
+            return results
+
+        for num_requests in PRESSURE_LEVELS:
+            pressure      = num_requests / LIMIT
+            p75s          = []
+            oa_ratios     = []
+            gossip_deltas = []
+
+            for iteration in range(ITERATIONS):
+                cpu_before    = read_cpu_times()
+                msgs_before   = await scrape_gossip_msgs(session)
+                bytes_before  = await scrape_gossip_bytes(session)
+                rounds_before = await scrape_gossip_rounds(session)
+
+                result = await measure_convergence(session, num_requests)
+
+                msgs_after   = await scrape_gossip_msgs(session)
+                bytes_after  = await scrape_gossip_bytes(session)
+                rounds_after = await scrape_gossip_rounds(session)
+                cpu_after    = read_cpu_times()
+
+                gossip_delta  = round(msgs_after - msgs_before, 0)
+                bytes_delta   = round(bytes_after - bytes_before, 0)
+                rounds_delta  = rounds_after[0] - rounds_before[0]
+                empty_delta   = rounds_after[1] - rounds_before[1]
+                useful_ratio  = round((rounds_delta - empty_delta) / rounds_delta, 3) if rounds_delta > 0 else None
+
+                result["iteration"]       = iteration
+                result["strategy"]        = label
+                result["tier_count"]      = tier_count
+                result["alpha"]           = alpha
+                result["continuous"]      = continuous
+                result["velocity_weight"] = velocity_weight
+                result["velocity_alpha"]  = velocity_alpha
+                result["gossip_msgs"]     = gossip_delta
+                result["gossip_bytes"]    = bytes_delta
+                result["gossip_rounds"]   = round(rounds_delta, 0)
+                result["empty_rounds"]    = round(empty_delta, 0)
+                result["useful_ratio"]    = useful_ratio
+                result["cpu_pct"]         = cpu_percent(cpu_before, cpu_after)
+
+                results.append(result)
+                p75s.append(result["p75_ms"])
+                oa_ratios.append(result["over_admission_ratio"])
+                if gossip_delta is not None:
+                    gossip_deltas.append(gossip_delta)
+
+                gossip_str = f"  gossip={gossip_delta:.0f}" if gossip_delta is not None else ""
+                sys.stdout.write(
+                    f"\r  {pressure:.0%} pressure: "
+                    f"iter {iteration+1}/{ITERATIONS}  "
+                    f"p75={result['p75_ms']:.0f}ms  "
+                    f"max={result['max_ms']:.0f}ms  "
+                    f"over_admission={result['over_admission_ratio']:.1%}"
+                    f"{gossip_str}"
+                )
+                sys.stdout.flush()
+                await asyncio.sleep(1)
+
+            avg_p75    = statistics.mean(p75s)
+            med_p75    = statistics.median(p75s)
+            avg_oa     = statistics.mean(oa_ratios)
+            avg_gossip = statistics.mean(gossip_deltas) if gossip_deltas else 0
+            print(
+                f"\n  => avg p75={avg_p75:.0f}ms  median p75={med_p75:.0f}ms  "
+                f"avg over_admission={avg_oa:.1%}  avg gossip_msgs={avg_gossip:.0f}"
+            )
+
+    return results
+
+
+def write_csv(results, filename):
+    path = os.path.join(RESULTS_DIR, filename)
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=[
+            "strategy", "tier_count", "alpha", "continuous",
+            "velocity_weight", "velocity_alpha",
+            "pressure", "requests", "iteration",
+            "allowed", "denied", "over_admission_count", "over_admission_ratio",
+            "burst_duration_ms",
+            "gossip_msgs", "gossip_bytes", "gossip_rounds", "empty_rounds", "useful_ratio",
+            "cpu_pct",
+            "node2_ms", "node3_ms", "node4_ms", "node5_ms",
+            "node2_pressure", "node3_pressure", "node4_pressure", "node5_pressure",
+            "p75_ms", "max_ms", "first_propagation_ms",
+        ])
+        writer.writeheader()
+        for row in results:
+            writer.writerow(row)
+    log(f"Wrote {len(results)} rows to {path}")
+
+
+def print_comparison(all_results):
+    labels    = [strategy_label(*s) for s in STRATEGIES]
+    present   = [l for l in labels if l in all_results]
+    fixed_lbl = strategy_label(1, 2.0, False, 0.0, 0.3)
+    fixed     = all_results.get(fixed_lbl, [])
+    col_w     = 13
+
+    header = "  " + f"{'Pressure':<10}" + "".join(
+        f"  {(l + ' OA%'):>{col_w}}" for l in present
+    )
+    sep = "=" * len(header)
+    print("\n" + sep)
+    print("  OVER-ADMISSION RATIO PER STRATEGY")
+    print(sep)
+    print(header)
+    print("-" * len(header))
+
+    for num_requests in PRESSURE_LEVELS:
+        pressure = num_requests / LIMIT
+        row = "  " + f"{str(round(pressure * 100)) + '%':<10}"
+        for l in present:
+            rows = [r for r in all_results[l] if r["requests"] == num_requests]
+            if rows:
+                oa_avg = statistics.mean(r["over_admission_ratio"] for r in rows)
+                row += f"  {oa_avg:>{col_w}.1%}"
+            else:
+                row += f"  {'N/A':>{col_w}}"
+        print(row)
+    print(sep)
+
+    non_fixed = [l for l in present if l != fixed_lbl]
+    if not fixed or not non_fixed:
         return
 
-    strategies = all_strategy_order(rows)
-    levels     = pressure_levels(rows)
-    by_strat   = group_by(rows, "strategy")
+    print("\n  OA REDUCTION VS FIXED")
+    header2 = "  " + f"{'Pressure':<10}" + "".join(f"  {l:>{col_w}}" for l in non_fixed)
+    print(header2)
+    print("-" * len(header2))
 
-    matrix = []
-    for s in strategies:
-        row_vals = []
-        for req in levels:
-            vals = [r["over_admission_ratio"] for r in by_strat.get(s, []) if r["requests"] == req]
-            row_vals.append(statistics.mean(vals) * 100 if vals else float("nan"))
-        matrix.append(row_vals)
-
-    data  = np.array(matrix)
-    valid = data[~np.isnan(data)]
-    if valid.size == 0:
-        print("  [skip] heatmap has no valid data")
-        return
-
-    fig, ax = plt.subplots(figsize=(max(8, len(levels) * 1.5), max(4, len(strategies) * 0.6)))
-    im = ax.imshow(data, aspect="auto", cmap="RdYlGn_r", vmin=0, vmax=valid.max())
-
-    ax.set_xticks(range(len(levels)))
-    ax.set_xticklabels([pressure_label(r) for r in levels])
-    ax.set_yticks(range(len(strategies)))
-    ax.set_yticklabels([label(s) for s in strategies], fontsize=8)
-    ax.set_xlabel("Load (% of rate limit)", fontsize=11)
-    ax.set_title("Over-Admission Ratio (%) — All Strategies × Load", fontsize=12)
-
-    for i in range(len(strategies)):
-        for j in range(len(levels)):
-            val = data[i, j]
-            if not np.isnan(val):
-                ax.text(j, i, f"{val:.0f}%", ha="center", va="center",
-                        fontsize=8, color="black" if val < 150 else "white")
-
-    fig.colorbar(im, ax=ax, label="OA ratio (%)")
-    fig.tight_layout()
-    save(fig, "06_oa_heatmap_all.png")
+    for num_requests in PRESSURE_LEVELS:
+        pressure = num_requests / LIMIT
+        f_rows   = [r for r in fixed if r["requests"] == num_requests]
+        f_oa     = statistics.mean(r["over_admission_ratio"] for r in f_rows) if f_rows else None
+        row = "  " + f"{str(round(pressure * 100)) + '%':<10}"
+        for l in non_fixed:
+            rows = [r for r in all_results[l] if r["requests"] == num_requests]
+            if rows and f_oa and f_oa > 0:
+                s_oa = statistics.mean(r["over_admission_ratio"] for r in rows)
+                row += f"  {(f_oa - s_oa) / f_oa:>{col_w}.1%}"
+            elif rows and f_oa == 0:
+                row += f"  {'(no OA)':>{col_w}}"
+            else:
+                row += f"  {'N/A':>{col_w}}"
+        print(row)
+    print()
 
 
-# ── Plot 7: Per-iteration OA variance ────────────────────────────────────────
+async def main():
+    start = time.monotonic()
+    all_results = {}
 
-def plot_oa_variance(rows):
-    strategies = all_strategy_order(rows)
-    levels     = [req for req in pressure_levels(rows) if req > LIMIT]
-    by_strat   = group_by(rows, "strategy")
+    for tier_count, alpha, continuous, velocity_weight, velocity_alpha in STRATEGIES:
+        set_strategy(tier_count, alpha, continuous, velocity_weight, velocity_alpha)
+        restart_cluster()
+        results = await run_benchmark(tier_count, alpha, continuous, velocity_weight, velocity_alpha)
+        label = strategy_label(tier_count, alpha, continuous, velocity_weight, velocity_alpha)
+        all_results[label] = results
+        write_csv(results, f"convergence_{label}.csv")
 
-    if not levels:
-        return
+    set_strategy(5, 2.0, False, 0.0, 0.3)
 
-    ncols = min(len(levels), 2)
-    nrows = math.ceil(len(levels) / ncols)
-    fig, axes = plt.subplots(nrows, ncols, figsize=(max(10, len(strategies)) * ncols, 5 * nrows), squeeze=False)
+    print_comparison(all_results)
 
-    for idx, req in enumerate(levels):
-        ax = axes[idx // ncols][idx % ncols]
-        for si, s in enumerate(strategies):
-            vals = [r["over_admission_ratio"] * 100
-                    for r in by_strat.get(s, []) if r["requests"] == req]
-            if vals:
-                jitter = [(si + 1) + (i - len(vals) / 2) * 0.05 for i in range(len(vals))]
-                ax.scatter(jitter, vals, color=color(s), alpha=0.7, s=50, zorder=4)
-                ax.hlines(statistics.mean(vals), si + 0.75, si + 1.25,
-                          colors=color(s), linewidth=2.5)
+    combined = [r for results in all_results.values() for r in results]
+    write_csv(combined, "convergence_combined.csv")
 
-        ax.set_xticks(range(1, len(strategies) + 1))
-        ax.set_xticklabels([label(s) for s in strategies], rotation=30, ha="right", fontsize=7)
-        ax.set_ylabel("OA ratio (%)", fontsize=10)
-        ax.set_title(f"Per-iteration OA variance at {pressure_label(req)} load", fontsize=11)
-        ax.grid(True, axis="y", alpha=0.3)
-
-    for idx in range(len(levels), nrows * ncols):
-        axes[idx // ncols][idx % ncols].set_visible(False)
-
-    fig.suptitle("OA Variance — Each dot = 1 iteration, bar = mean", fontsize=12)
-    fig.tight_layout()
-    save(fig, "07_oa_variance.png")
-
-
-# ── Plot 8: CPU % by strategy ─────────────────────────────────────────────────
-
-def plot_cpu(rows):
-    strategies = all_strategy_order(rows)
-    levels     = pressure_levels(rows)
-    by_strat   = group_by(rows, "strategy")
-
-    fig, ax = plt.subplots(figsize=(9, 5))
-    for s in strategies:
-        xs, ys = [], []
-        for req in levels:
-            vals = [r["cpu_pct"] for r in by_strat.get(s, [])
-                    if r["requests"] == req and r["cpu_pct"] > 0]
-            if vals:
-                xs.append(req / LIMIT * 100)
-                ys.append(statistics.mean(vals))
-        if xs:
-            lw = 2 if s in BASE_STRATEGY_ORDER else 1.5
-            ls = "-" if s in BASE_STRATEGY_ORDER else "--"
-            ax.plot(xs, ys, marker="o", linewidth=lw, linestyle=ls,
-                    color=color(s), label=label(s), markersize=5)
-
-    ax.set_xlabel("Load (% of rate limit)", fontsize=11)
-    ax.set_ylabel("CPU usage (%)", fontsize=11)
-    ax.set_title("System CPU Usage by Strategy and Load", fontsize=12)
-    ax.xaxis.set_major_formatter(mticker.FormatStrFormatter("%g%%"))
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    save(fig, "08_cpu_usage.png")
-
-def label(s):
-    if s in STRATEGY_LABELS:
-        return STRATEGY_LABELS[s]
-    # auto-generate from name
-    parts = s.split("_v")
-    base = parts[0]
-    if len(parts) > 1:
-        vparts = parts[1].split("_va")
-        vw = vparts[0]
-        va = vparts[1] if len(vparts) > 1 else "?"
-        return f"{base} vel={vw} α={va}"
-    return s
-
-def color(s):
-    if s in COLORS:
-        return COLORS[s]
-    # generate a color from the strategy name hash so it's consistent
-    import hashlib
-    h = int(hashlib.md5(s.encode()).hexdigest()[:6], 16)
-    r = ((h >> 16) & 0xFF) / 255
-    g = ((h >> 8) & 0xFF) / 255
-    b = (h & 0xFF) / 255
-    # brighten dark colors
-    r = 0.3 + r * 0.7
-    g = 0.3 + g * 0.7
-    b = 0.3 + b * 0.7
-    return (r, g, b)
-# ── Main ──────────────────────────────────────────────────────────────────────
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--csv", default=DEFAULT_CSV, help="Path to combined CSV")
-    args = parser.parse_args()
-
-    if not os.path.exists(args.csv):
-        print(f"ERROR: CSV not found: {args.csv}")
-        sys.exit(1)
-
-    print(f"Loading {args.csv}")
-    rows = load_csv(args.csv)
-    strats = sorted({r["strategy"] for r in rows})
-    print(f"  {len(rows)} rows, {len(strats)} strategies: {strats}")
-    print(f"Generating plots → {PLOTS_DIR}/")
-
-    plot_oa_by_pressure(rows)
-    plot_oa_velocity_comparison(rows)
-    plot_first_propagation(rows)
-    plot_bytes_efficiency(rows)
-    plot_velocity_sweep(rows)
-    plot_oa_heatmap(rows)
-    plot_oa_variance(rows)
-    plot_cpu(rows)
-
-    print("\nDone. All plots saved.")
+    elapsed = time.monotonic() - start
+    print(f"\nDone in {elapsed/60:.1f} minutes. Results in {RESULTS_DIR}/")
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
